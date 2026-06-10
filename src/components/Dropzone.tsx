@@ -26,10 +26,9 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
 
   return (
     <div className="flex-1 min-h-0 flex items-center justify-center p-6 fade-up">
-      <button
-        type="button"
-        aria-label="Upload an image"
-        onClick={() => inputRef.current?.click()}
+      {/* A <label> opens the native file picker on click with no JS — the most
+          reliable pattern. The input is a sibling, never nested in a button. */}
+      <label
         onDragOver={(e) => {
           e.preventDefault()
           setOver(true)
@@ -40,19 +39,30 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
           setOver(false)
           accept(e.dataTransfer.files[0])
         }}
-        className="group relative w-full max-w-3xl border border-dashed px-8 py-24 text-center transition-colors duration-200 cursor-pointer"
+        className="group relative block w-full max-w-3xl border border-dashed px-8 py-24 text-center transition-colors duration-200 cursor-pointer"
         style={{
           borderColor: over ? 'var(--amber-soft)' : 'var(--line-strong)',
           background: over ? 'rgba(232,163,61,0.04)' : 'transparent',
         }}
       >
-        <div
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          className="sr-only"
+          aria-label="Upload an image"
+          onChange={(e) => {
+            accept(e.target.files?.[0])
+            e.target.value = ''
+          }}
+        />
+        <span
           aria-hidden
-          className="text-amber transition-transform duration-300 group-hover:scale-110"
+          className="block text-amber transition-transform duration-300 group-hover:scale-110"
           style={{ fontSize: 28, lineHeight: 1 }}
         >
           ✦
-        </div>
+        </span>
         <h1
           className="mt-8 text-ink"
           style={{ fontFamily: 'var(--font-serif), serif', fontSize: 'clamp(34px, 5vw, 52px)', lineHeight: 1.1 }}
@@ -61,23 +71,13 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
           <br />
           <em className="text-amber">Keep the picture.</em>
         </h1>
-        <p className="label mt-10 text-ink-dim">
+        <span className="label mt-10 block text-ink-dim">
           drop an image — click to browse — or paste
-        </p>
-        <p className="label mt-3 text-ink-faint">
-          processed on this device · nothing is uploaded
-        </p>
-        <input
-          ref={inputRef}
-          type="file"
-          accept="image/*"
-          className="hidden"
-          onChange={(e) => {
-            accept(e.target.files?.[0])
-            e.target.value = ''
-          }}
-        />
-      </button>
+        </span>
+        <span className="label mt-3 block text-ink-faint">
+          the watermark is removed automatically · nothing is uploaded
+        </span>
+      </label>
     </div>
   )
 }

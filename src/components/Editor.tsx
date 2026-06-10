@@ -33,6 +33,8 @@ export default function Editor({
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskUndoStack = useRef<ImageData[]>([])
   const eraseHistory = useRef<ImageData[]>([])
+  const busyRef = useRef(false)
+  const autoRanRef = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
   const [fit, setFit] = useState<Dims>({ w: 0, h: 0 })
@@ -87,6 +89,7 @@ export default function Editor({
         bmp.close()
         maskUndoStack.current = []
         eraseHistory.current = []
+        autoRanRef.current = false
         setMaskActions(0)
         setEraseCount(0)
         setError(null)
@@ -173,18 +176,23 @@ export default function Editor({
     drawState.current.active = false
   }
 
-  /** One-tap mask over the bottom-right corner where Gemini stamps its ✦. */
+  /** Paint a mask over the bottom-right corner where the ✦ watermark sits. */
+  const paintCornerMask = (d: Dims) => {
+    const s = Math.round(Math.min(d.w, d.h) * 0.17)
+    const margin = Math.round(Math.min(d.w, d.h) * 0.015)
+    const ctx = maskCtx()
+    ctx.fillStyle = '#e8a33d'
+    ctx.beginPath()
+    ctx.roundRect(d.w - s - margin, d.h - s - margin, s, s, s * 0.18)
+    ctx.fill()
+  }
+
+  /** One-tap corner mask (manual button). */
   const cornerPreset = () => {
     if (!dims || busy) return
     snapshotMask()
     setMaskActions((n) => n + 1)
-    const s = Math.round(Math.min(dims.w, dims.h) * 0.17)
-    const margin = Math.round(Math.min(dims.w, dims.h) * 0.015)
-    const ctx = maskCtx()
-    ctx.fillStyle = '#e8a33d'
-    ctx.beginPath()
-    ctx.roundRect(dims.w - s - margin, dims.h - s - margin, s, s, s * 0.18)
-    ctx.fill()
+    paintCornerMask(dims)
   }
 
   const undo = () => {
@@ -209,8 +217,10 @@ export default function Editor({
     setMaskActions(0)
   }, [busy, dims])
 
-  const erase = useCallback(async () => {
-    if (busy || !dims || maskActions === 0) return
+  // Core erase: reconstructs whatever is painted on the mask canvas.
+  const runErase = useCallback(async () => {
+    if (busyRef.current || !dims) return
+    busyRef.current = true
     setBusy(true)
     setError(null)
     try {
@@ -239,18 +249,36 @@ export default function Editor({
       console.error(err)
       setError('Inpainting failed — try a smaller image or reload.')
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
-  }, [busy, dims, maskActions, onModelProgress])
+  }, [dims, onModelProgress])
+
+  const erase = useCallback(() => {
+    if (maskActions === 0) return
+    void runErase()
+  }, [maskActions, runErase])
+
+  // Automatically remove the corner watermark once the image is decoded and
+  // the model is ready — the user lands straight on the cleaned result.
+  useEffect(() => {
+    if (autoRanRef.current || !dims || model.state !== 'ready' || busyRef.current) return
+    autoRanRef.current = true
+    paintCornerMask(dims)
+    void runErase()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dims, model.state, runErase])
 
   const download = () => {
-    const stem = file.name.replace(/\.[^.]+$/, '') || 'image'
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
+      b.toString(16).padStart(2, '0')
+    ).join('')
     imgCanvasRef.current!.toBlob((blob) => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `${stem}-clean.png`
+      a.download = `Unmark_${token}.png`
       a.click()
       URL.revokeObjectURL(url)
     }, 'image/png')
@@ -279,16 +307,19 @@ export default function Editor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy, dims])
 
-  const modelLabel =
-    model.state === 'ready'
-      ? 'model ready'
+  const status = busy
+    ? 'removing watermark…'
+    : eraseCount > 0
+      ? 'watermark removed — brush to refine, or save your image'
       : model.state === 'error'
         ? 'model unavailable'
-        : model.pct === null
-          ? 'loading model'
-          : model.pct >= 1
-            ? 'compiling model'
-            : `loading model ${Math.round(model.pct * 100)}%`
+        : model.state === 'ready'
+          ? 'model ready'
+          : model.pct === null
+            ? 'loading model…'
+            : model.pct >= 1
+              ? 'compiling model…'
+              : `loading model ${Math.round(model.pct * 100)}%`
 
   return (
     <div className="flex-1 min-h-0 flex flex-col fade-up">
@@ -339,7 +370,7 @@ export default function Editor({
           {/* processing veil */}
           {busy && (
             <div className="absolute inset-0 flex items-end justify-center pb-4 bg-black/30">
-              <span className="label text-amber pulse-dim">erasing…</span>
+              <span className="label text-amber pulse-dim">removing watermark…</span>
             </div>
           )}
           {comparing && (
@@ -361,8 +392,17 @@ export default function Editor({
 
       {/* status / error line */}
       <div className="px-6 pb-2 flex justify-center">
-        <span className="label" style={{ color: error ? '#d96c47' : 'var(--ink-faint)' }}>
-          {error ?? modelLabel}
+        <span
+          className="label"
+          style={{
+            color: error
+              ? '#d96c47'
+              : eraseCount > 0 && !busy
+                ? 'var(--amber)'
+                : 'var(--ink-faint)',
+          }}
+        >
+          {error ?? status}
         </span>
       </div>
 
