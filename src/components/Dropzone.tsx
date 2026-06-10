@@ -63,8 +63,11 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
         >
           ✦
         </span>
+        <span className="label mt-8 block text-ink-dim">
+          Free AI watermark remover · in your browser
+        </span>
         <h1
-          className="mt-8 text-ink"
+          className="mt-4 text-ink"
           style={{ fontFamily: 'var(--font-serif), serif', fontSize: 'clamp(34px, 5vw, 52px)', lineHeight: 1.1 }}
         >
           Erase the mark.
