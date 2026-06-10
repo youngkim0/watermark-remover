@@ -1,26 +1,147 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #11100e;
+  --surface: #181612;
+  --line: #2b2822;
+  --line-strong: #3d3930;
+  --ink: #ece8df;
+  --ink-dim: #918b7e;
+  --ink-faint: #5c574c;
+  --amber: #e8a33d;
+  --amber-soft: rgba(232, 163, 61, 0.45);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-dim: var(--ink-dim);
+  --color-ink-faint: var(--ink-faint);
+  --color-amber: var(--amber);
+  --font-serif: var(--font-serif);
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-mono), monospace;
+  /* faint safelight glow from above, darkness pooling below */
+  background-image: radial-gradient(
+      ellipse 120% 90% at 50% -10%,
+      rgba(232, 163, 61, 0.045),
+      transparent 55%
+    ),
+    radial-gradient(ellipse 100% 70% at 50% 110%, rgba(0, 0, 0, 0.5), transparent 60%);
+  background-attachment: fixed;
+}
+
+::selection {
+  background: var(--amber);
+  color: #181612;
+}
+
+/* mono UI label */
+.label {
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* hairline-bordered control */
+.ctrl {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-dim);
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+.ctrl:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+.ctrl:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.ctrl[data-active="true"] {
+  color: var(--amber);
+  border-color: var(--amber-soft);
+}
+
+/* brush size slider */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1px;
+  background: var(--line-strong);
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--ink);
+  border: none;
+  transition: background 140ms ease;
+}
+input[type="range"]:hover::-webkit-slider-thumb {
+  background: var(--amber);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--ink);
+  border: none;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.fade-up {
+  animation: fade-up 500ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pulse-dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+.pulse-dim {
+  animation: pulse-dim 1.6s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(400%);
+  }
+}
+.progress-indeterminate {
+  animation: progress-slide 1.2s ease-in-out infinite;
 }
