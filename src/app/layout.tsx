@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Instrument_Serif, IBM_Plex_Mono } from "next/font/google";
-import { Analytics } from "@vercel/analytics/next";
+import Script from "next/script";
 import "./globals.css";
 import { SITE_URL, SITE_NAME, FAQ } from "@/lib/content";
 
@@ -110,7 +110,15 @@ export default function RootLayout({
     <html lang="en" className={`${serif.variable} ${mono.variable} h-full antialiased`}>
       <body className="min-h-full flex flex-col">
         {children}
-        <Analytics />
+        {process.env.NEXT_PUBLIC_UMAMI_WEBSITE_ID && (
+          <Script
+            src="https://cloud.umami.is/script.js"
+            data-website-id={process.env.NEXT_PUBLIC_UMAMI_WEBSITE_ID}
+            // COEP: require-corp (WASM isolation) blocks cross-origin scripts
+            // unless loaded via CORS; Umami serves Access-Control-Allow-Origin: *.
+            crossOrigin="anonymous"
+          />
+        )}
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
