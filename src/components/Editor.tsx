@@ -34,7 +34,6 @@ export default function Editor({
   const maskUndoStack = useRef<ImageData[]>([])
   const eraseHistory = useRef<ImageData[]>([])
   const busyRef = useRef(false)
-  const autoRanRef = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
   const [fit, setFit] = useState<Dims>({ w: 0, h: 0 })
@@ -89,7 +88,6 @@ export default function Editor({
         bmp.close()
         maskUndoStack.current = []
         eraseHistory.current = []
-        autoRanRef.current = false
         setMaskActions(0)
         setEraseCount(0)
         setError(null)
@@ -259,16 +257,6 @@ export default function Editor({
     void runErase()
   }, [maskActions, runErase])
 
-  // Automatically remove the corner watermark once the image is decoded and
-  // the model is ready — the user lands straight on the cleaned result.
-  useEffect(() => {
-    if (autoRanRef.current || !dims || model.state !== 'ready' || busyRef.current) return
-    autoRanRef.current = true
-    paintCornerMask(dims)
-    void runErase()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dims, model.state, runErase])
-
   const download = () => {
     const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
       b.toString(16).padStart(2, '0')
@@ -308,13 +296,13 @@ export default function Editor({
   }, [busy, dims])
 
   const status = busy
-    ? 'removing watermark…'
+    ? 'erasing…'
     : eraseCount > 0
-      ? 'watermark removed — brush over anything else, or save your image'
+      ? 'erased — brush over anything else, or save your image'
       : model.state === 'error'
         ? 'model unavailable'
         : model.state === 'ready'
-          ? 'model ready'
+          ? 'tap ✦ corner for the watermark, or brush over anything — then erase'
           : model.pct === null
             ? 'loading model…'
             : model.pct >= 1
@@ -370,7 +358,7 @@ export default function Editor({
           {/* processing veil */}
           {busy && (
             <div className="absolute inset-0 flex items-end justify-center pb-4 bg-black/30">
-              <span className="label text-amber pulse-dim">removing watermark…</span>
+              <span className="label text-amber pulse-dim">erasing…</span>
             </div>
           )}
           {comparing && (

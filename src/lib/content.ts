@@ -40,7 +40,7 @@ export const STEPS: { n: string; title: string; body: string }[] = [
   {
     n: '02',
     title: 'Erase what you don’t want',
-    body: 'The corner watermark is removed automatically. Brush over any other object, person or text to wipe it too.',
+    body: 'Tap the corner preset for a watermark, or brush over any object, person or text. Press erase and the model rebuilds the background behind it.',
   },
   {
     n: '03',

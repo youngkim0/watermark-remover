@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import Dropzone from '@/components/Dropzone'
 import Editor from '@/components/Editor'
 import { USE_CASES, STEPS, REASONS, FAQ } from '@/lib/content'
@@ -33,7 +33,7 @@ function Footer() {
       <span className="label text-ink-faint hidden sm:block">
         mi-gan · onnx runtime · webgpu/wasm
       </span>
-      <span className="label text-ink-faint">images never leave this device</span>
+      <span className="label text-ink-faint">© 2026 ezpz co.</span>
     </footer>
   )
 }
@@ -41,11 +41,30 @@ function Footer() {
 export default function Home() {
   const [file, setFile] = useState<File | null>(null)
 
+  // Opening the editor pushes a history entry, so the browser Back button
+  // returns to the upload screen instead of leaving the site.
+  const openFile = useCallback((f: File) => {
+    window.history.pushState({ unmarkEditor: true }, '')
+    setFile(f)
+  }, [])
+
+  // Leaving the editor (logo, "new image", or Back) pops that entry.
+  const closeFile = useCallback(() => {
+    if (window.history.state?.unmarkEditor) window.history.back()
+    else setFile(null)
+  }, [])
+
+  useEffect(() => {
+    const onPop = () => setFile(null)
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
   if (file) {
     return (
       <main className="h-dvh flex flex-col">
-        <Header onHome={() => setFile(null)} />
-        <Editor key={`${file.name}-${file.lastModified}`} file={file} onReplace={() => setFile(null)} />
+        <Header onHome={closeFile} />
+        <Editor key={`${file.name}-${file.lastModified}`} file={file} onReplace={closeFile} />
         <Footer />
       </main>
     )
@@ -53,11 +72,11 @@ export default function Home() {
 
   return (
     <main className="min-h-dvh flex flex-col">
-      <Header onHome={() => setFile(null)} />
+      <Header onHome={closeFile} />
 
       {/* hero — fills the first screen */}
       <div className="flex flex-col" style={{ minHeight: 'calc(100dvh - 116px)' }}>
-        <Dropzone onFile={setFile} />
+        <Dropzone onFile={openFile} />
       </div>
 
       {/* crawlable content below the fold */}
