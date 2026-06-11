@@ -18,12 +18,12 @@ const mono = IBM_Plex_Mono({
 });
 
 const DESCRIPTION =
-  "Remove watermarks from images free, right in your browser. Unmark erases the AI sparkle from Gemini and Nano Banana, plus logos, text and timestamps — your photos never leave your device.";
+  "Erase anything from a photo, free and in your browser. Unmark removes AI watermarks from Gemini and Nano Banana, plus objects, people, text, logos and timestamps — your images never leave your device.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "Unmark — Free AI Watermark Remover, In Your Browser",
+    default: "Unmark — Free AI Watermark Remover & Magic Eraser",
     template: "%s · Unmark",
   },
   description: DESCRIPTION,
@@ -37,8 +37,13 @@ export const metadata: Metadata = {
     "remove watermark from image",
     "free watermark remover",
     "online watermark remover",
-    "remove watermark online",
+    "magic eraser",
+    "AI object remover",
+    "remove object from photo",
+    "remove person from photo",
+    "remove text from image",
     "remove logo from photo",
+    "photo cleanup",
     "image inpainting",
   ],
   authors: [{ name: SITE_NAME }],
@@ -49,13 +54,13 @@ export const metadata: Metadata = {
     type: "website",
     url: SITE_URL,
     siteName: SITE_NAME,
-    title: "Unmark — Free AI Watermark Remover, In Your Browser",
+    title: "Unmark — Free AI Watermark Remover & Magic Eraser",
     description: DESCRIPTION,
     locale: "en_US",
   },
   twitter: {
     card: "summary_large_image",
-    title: "Unmark — Free AI Watermark Remover",
+    title: "Unmark — Free AI Watermark Remover & Magic Eraser",
     description: DESCRIPTION,
   },
   robots: {
@@ -79,9 +84,10 @@ const jsonLd = {
       offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
       featureList: [
         "Remove AI watermarks from images",
+        "Magic eraser brush for any unwanted object",
+        "Remove people, text, logos and timestamps from photos",
         "On-device processing — no uploads",
         "Automatic corner watermark removal",
-        "Manual brush for logos, text and objects",
       ],
     },
     {

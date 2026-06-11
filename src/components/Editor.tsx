@@ -310,7 +310,7 @@ export default function Editor({
   const status = busy
     ? 'removing watermark…'
     : eraseCount > 0
-      ? 'watermark removed — brush to refine, or save your image'
+      ? 'watermark removed — brush over anything else, or save your image'
       : model.state === 'error'
         ? 'model unavailable'
         : model.state === 'ready'

@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import Dropzone from '@/components/Dropzone'
 import Editor from '@/components/Editor'
-import { STEPS, REASONS, FAQ } from '@/lib/content'
+import { USE_CASES, STEPS, REASONS, FAQ } from '@/lib/content'
 
 function Header({ onHome }: { onHome: () => void }) {
   return (
@@ -19,7 +19,7 @@ function Header({ onHome }: { onHome: () => void }) {
       >
         Unmark<span className="text-amber not-italic">.</span>
       </button>
-      <span className="label text-ink-faint hidden sm:block">on-device watermark eraser</span>
+      <span className="label text-ink-faint hidden sm:block">watermark remover · magic eraser</span>
     </header>
   )
 }
@@ -63,6 +63,21 @@ export default function Home() {
       {/* crawlable content below the fold */}
       <div className="px-6 pb-24">
         <div className="mx-auto w-full max-w-3xl">
+          <Section kicker="more than watermarks" title="Erase anything from a photo">
+            <div className="mt-10 grid gap-px sm:grid-cols-2 lg:grid-cols-3" style={{ background: 'var(--line)' }}>
+              {USE_CASES.map((u) => (
+                <div key={u.title} className="bg-bg p-6">
+                  <h3 className="text-ink" style={{ fontSize: 15, fontWeight: 500 }}>
+                    {u.title}
+                  </h3>
+                  <p className="mt-3 text-ink-dim" style={{ fontSize: 14, lineHeight: 1.6 }}>
+                    {u.body}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </Section>
+
           <Section kicker="how it works" title="Remove a watermark in three steps">
             <ol className="mt-10 grid gap-px sm:grid-cols-3" style={{ background: 'var(--line)' }}>
               {STEPS.map((s) => (

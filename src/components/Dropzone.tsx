@@ -64,7 +64,7 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
           ✦
         </span>
         <span className="label mt-8 block text-ink-dim">
-          Free AI watermark remover · in your browser
+          Free AI watermark remover &amp; magic eraser · in your browser
         </span>
         <h1
           className="mt-4 text-ink"
@@ -78,7 +78,7 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
           drop an image — click to browse — or paste
         </span>
         <span className="label mt-3 block text-ink-faint">
-          the watermark is removed automatically · nothing is uploaded
+          watermarks, objects, people, text — brushed away · nothing is uploaded
         </span>
       </label>
     </div>

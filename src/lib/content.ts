@@ -1,7 +1,35 @@
 export const SITE_URL = 'https://unmark.live'
 export const SITE_NAME = 'Unmark'
 
-export const TAGLINE = 'Free AI watermark remover — in your browser'
+export const TAGLINE = 'Free AI watermark remover & magic eraser — in your browser'
+
+// What the inpainting brush can remove. Watermarks lead; the rest shows breadth.
+export const USE_CASES: { title: string; body: string }[] = [
+  {
+    title: 'AI watermarks',
+    body: 'The ✦ sparkle that Gemini, Nano Banana and other generators stamp on images — gone in one tap.',
+  },
+  {
+    title: 'Objects & clutter',
+    body: 'Power lines, signs, trash cans, a stray hand — brush over anything you wish weren’t in the frame.',
+  },
+  {
+    title: 'People & photobombers',
+    body: 'Wipe a stranger out of the background of an otherwise perfect shot.',
+  },
+  {
+    title: 'Text, logos & captions',
+    body: 'Stock-photo overlays, captions, brand marks and stamps lift cleanly off the image.',
+  },
+  {
+    title: 'Dates & timestamps',
+    body: 'Erase the orange camera date burned into old photos.',
+  },
+  {
+    title: 'Blemishes & spots',
+    body: 'Dust, sensor spots and small skin blemishes disappear into the background.',
+  },
+]
 
 export const STEPS: { n: string; title: string; body: string }[] = [
   {
@@ -11,8 +39,8 @@ export const STEPS: { n: string; title: string; body: string }[] = [
   },
   {
     n: '02',
-    title: 'The watermark is erased automatically',
-    body: 'Unmark masks the corner mark and rebuilds the pixels with a generative inpainting model. Brush over anything else you want gone.',
+    title: 'Erase what you don’t want',
+    body: 'The corner watermark is removed automatically. Brush over any other object, person or text to wipe it too.',
   },
   {
     n: '03',
@@ -28,18 +56,22 @@ export const REASONS: { title: string; body: string }[] = [
   },
   {
     title: 'Actually free',
-    body: 'No sign-up, no credits, no daily caps. Because removal runs on your device, there are no server bills to pass on.',
+    body: 'No sign-up, no credits, no daily caps. Because everything runs on your device, there are no server bills to pass on.',
   },
   {
     title: 'Studio quality',
-    body: 'A MI-GAN inpainting model reconstructs real texture instead of smearing a blur over the spot.',
+    body: 'A MI-GAN inpainting model rebuilds real texture behind whatever you erase, instead of smearing a blur over it.',
   },
 ]
 
 export const FAQ: { q: string; a: string }[] = [
   {
     q: 'Is Unmark free?',
-    a: 'Yes. Unmark is completely free with no sign-up, no credits and no daily limits. Because the watermark removal runs on your own device, there are no server costs to pass on.',
+    a: 'Yes. Unmark is completely free with no sign-up, no credits and no daily limits. Because everything runs on your own device, there are no server costs to pass on.',
+  },
+  {
+    q: 'Can Unmark remove objects and people, not just watermarks?',
+    a: 'Yes — Unmark is a full magic eraser. Brush over any object, person, sign, text or blemish and the model reconstructs the background behind it. Removing the corner watermark is just the one-tap default.',
   },
   {
     q: 'Are my images uploaded anywhere?',
@@ -59,6 +91,6 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: 'Can I use it on any image?',
-    a: 'Use Unmark only on images you own or have the rights to edit. Removing watermarks from other people’s copyrighted work may be illegal.',
+    a: 'Use Unmark only on images you own or have the rights to edit. Removing watermarks or content from other people’s copyrighted work may be illegal.',
   },
 ]
