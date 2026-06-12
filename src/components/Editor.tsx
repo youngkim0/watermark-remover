@@ -1,7 +1,14 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { inpaint, preloadModel, type InpaintPatch, type InpaintProgress } from '@/lib/inpaint'
+import {
+  computeCrop,
+  inpaint,
+  preloadModel,
+  type InpaintPatch,
+  type InpaintProgress,
+  type Rect,
+} from '@/lib/inpaint'
 import { track } from '@/lib/analytics'
 
 const MAX_SIDE = 4096
@@ -26,6 +33,38 @@ type Dims = { w: number; h: number }
 type MaskStroke =
   | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
   | { kind: 'corner' }
+
+/** Bottom-right square where the ✦ watermark sits. */
+function cornerRect(d: Dims): Rect {
+  const s = Math.round(Math.min(d.w, d.h) * 0.17)
+  const margin = Math.round(Math.min(d.w, d.h) * 0.015)
+  return { x: d.w - s - margin, y: d.h - s - margin, w: s, h: s }
+}
+
+/** Bounding box of everything painted, from stroke geometry — avoids
+ *  reading full-resolution pixel data to find the mask. */
+function strokesBBox(strokes: MaskStroke[], d: Dims): Rect | null {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (const s of strokes) {
+    if (s.kind === 'corner') {
+      const r = cornerRect(d)
+      x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y)
+      x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h)
+    } else {
+      const r = s.width / 2 + 1
+      for (const pt of s.points) {
+        x0 = Math.min(x0, pt.x - r); y0 = Math.min(y0, pt.y - r)
+        x1 = Math.max(x1, pt.x + r); y1 = Math.max(y1, pt.y + r)
+      }
+    }
+  }
+  if (x1 < x0) return null
+  const cx = (v: number) => Math.min(Math.max(Math.round(v), 0), d.w)
+  const cy = (v: number) => Math.min(Math.max(Math.round(v), 0), d.h)
+  const bx = cx(x0), by = cy(y0)
+  const bw = cx(x1) - bx, bh = cy(y1) - by
+  return bw > 0 && bh > 0 ? { x: bx, y: by, w: bw, h: bh } : null
+}
 
 function fitContain(img: Dims, box: Dims): Dims {
   const scale = Math.min(box.w / img.w, box.h / img.h, 1)
@@ -207,12 +246,11 @@ export default function Editor({
 
   /** Paint a mask over the bottom-right corner where the ✦ watermark sits. */
   const paintCornerMask = (d: Dims) => {
-    const s = Math.round(Math.min(d.w, d.h) * 0.17)
-    const margin = Math.round(Math.min(d.w, d.h) * 0.015)
+    const r = cornerRect(d)
     const ctx = maskCtx()
     ctx.fillStyle = MASK_COLOR
     ctx.beginPath()
-    ctx.roundRect(d.w - s - margin, d.h - s - margin, s, s, s * 0.18)
+    ctx.roundRect(r.x, r.y, r.w, r.h, r.w * 0.18)
     ctx.fill()
   }
 
@@ -272,10 +310,16 @@ export default function Editor({
     setBusy(true)
     setError(null)
     try {
+      // Work on the crop window around the mask, never the full frame:
+      // two full-res ImageData reads per erase (~100MB on a 12MP photo)
+      // are enough churn to get mobile tabs killed.
+      const bbox = strokesBBox(maskStrokes.current, dims)
+      if (!bbox) return
+      const crop = computeCrop(bbox, dims.w, dims.h)
       const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
-      const image = imgCtx.getImageData(0, 0, dims.w, dims.h)
-      const maskData = maskCtx().getImageData(0, 0, dims.w, dims.h)
-      const mask = new Uint8Array(dims.w * dims.h)
+      const image = imgCtx.getImageData(crop.x, crop.y, crop.w, crop.h)
+      const maskData = maskCtx().getImageData(crop.x, crop.y, crop.w, crop.h)
+      const mask = new Uint8Array(crop.w * crop.h)
       let painted = 0
       for (let i = 0; i < mask.length; i++) {
         if (maskData.data[i * 4 + 3] > 16) {
@@ -289,8 +333,10 @@ export default function Editor({
       track('erase', { count: eraseCount + 1, ms: Math.round(performance.now() - t0) })
       setModel({ state: 'ready' })
       if (result) {
-        const prior = imgCtx.getImageData(result.x, result.y, result.data.width, result.data.height)
-        eraseHistory.current.push({ x: result.x, y: result.y, data: prior })
+        const ax = crop.x + result.x
+        const ay = crop.y + result.y
+        const prior = imgCtx.getImageData(ax, ay, result.data.width, result.data.height)
+        eraseHistory.current.push({ x: ax, y: ay, data: prior })
         let bytes = eraseHistory.current.reduce((n, p) => n + p.data.data.byteLength, 0)
         while (
           eraseHistory.current.length > MAX_UNDO ||
@@ -298,7 +344,7 @@ export default function Editor({
         ) {
           bytes -= eraseHistory.current.shift()!.data.data.byteLength
         }
-        imgCtx.putImageData(result.data, result.x, result.y)
+        imgCtx.putImageData(result.data, ax, ay)
       }
       maskCtx().clearRect(0, 0, dims.w, dims.h)
       maskStrokes.current = []

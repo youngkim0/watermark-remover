@@ -11,7 +11,15 @@ type OrtModule = typeof import('onnxruntime-web/webgpu')
 
 let ortPromise: Promise<OrtModule> | null = null
 function loadOrt(): Promise<OrtModule> {
-  if (!ortPromise) ortPromise = import('onnxruntime-web/webgpu')
+  if (!ortPromise) {
+    // WebKit 26's wasm tier-up compiler chokes on ort's JSEP/JSPI builds:
+    // CPU pegs and memory grows ~0.7GB per run() until iOS kills the tab
+    // (onnxruntime#26827). The plain non-JSEP wasm backend is unaffected,
+    // and WebKit never uses WebGPU here anyway (see isWebKitEngine).
+    ortPromise = isWebKitEngine()
+      ? (import('onnxruntime-web') as Promise<OrtModule>)
+      : import('onnxruntime-web/webgpu')
+  }
   return ortPromise
 }
 
@@ -72,7 +80,15 @@ async function fetchModel(onProgress?: ProgressFn): Promise<ArrayBuffer> {
 
 async function createSession(onProgress?: ProgressFn): Promise<InferenceSession> {
   const ort = await loadOrt()
-  ort.env.wasm.wasmPaths = '/ort/'
+  // On WebKit, pin the exact non-JSEP binary — the loader would otherwise
+  // feature-detect JSPI (WebKit 26 has it) and pick a build that triggers
+  // the tier-up compiler bug above.
+  ort.env.wasm.wasmPaths = isWebKitEngine()
+    ? {
+        wasm: '/ort/ort-wasm-simd-threaded.wasm',
+        mjs: '/ort/ort-wasm-simd-threaded.mjs',
+      }
+    : '/ort/'
   const webgpu = await hasWebGPU()
   if (!webgpu) {
     ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency ?? 4, 8)
@@ -108,7 +124,7 @@ export function preloadModel(onProgress?: ProgressFn): Promise<unknown> {
   return getSession(onProgress)
 }
 
-type Rect = { x: number; y: number; w: number; h: number }
+export type Rect = { x: number; y: number; w: number; h: number }
 
 function maskBBox(mask: Uint8Array, w: number, h: number): Rect | null {
   let x0 = w, y0 = h, x1 = -1, y1 = -1
@@ -134,9 +150,14 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 const CROP_TARGET = 512
 const CROP_PAD = 96
 
-function computeCrop(bbox: Rect, w: number, h: number): Rect {
-  const cw = Math.min(w, Math.max(CROP_TARGET, bbox.w + CROP_PAD * 2))
-  const ch = Math.min(h, Math.max(CROP_TARGET, bbox.h + CROP_PAD * 2))
+export function computeCrop(bbox: Rect, w: number, h: number): Rect {
+  let cw = Math.min(w, Math.max(CROP_TARGET, bbox.w + CROP_PAD * 2))
+  let ch = Math.min(h, Math.max(CROP_TARGET, bbox.h + CROP_PAD * 2))
+  // Quantize to multiples of 256 so repeated erases reuse a handful of
+  // tensor shapes — ort's wasm arena grows for every distinct input shape
+  // and never shrinks.
+  cw = Math.min(w, Math.ceil(cw / 256) * 256)
+  ch = Math.min(h, Math.ceil(ch / 256) * 256)
   const x = clamp(Math.round(bbox.x + bbox.w / 2 - cw / 2), 0, w - cw)
   const y = clamp(Math.round(bbox.y + bbox.h / 2 - ch / 2), 0, h - ch)
   return { x, y, w: cw, h: ch }
