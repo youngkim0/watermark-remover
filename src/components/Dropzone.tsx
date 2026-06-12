@@ -1,14 +1,22 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { track } from '@/lib/analytics'
 
 export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [over, setOver] = useState(false)
 
   const accept = useCallback(
-    (file: File | null | undefined) => {
-      if (file && file.type.startsWith('image/')) onFile(file)
+    (file: File | null | undefined, method: 'click' | 'drop' | 'paste') => {
+      if (file && file.type.startsWith('image/')) {
+        track('image-selected', {
+          method,
+          type: file.type,
+          size_kb: Math.round(file.size / 1024),
+        })
+        onFile(file)
+      }
     },
     [onFile]
   )
@@ -18,7 +26,7 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
       const item = Array.from(e.clipboardData?.items ?? []).find((i) =>
         i.type.startsWith('image/')
       )
-      if (item) accept(item.getAsFile())
+      if (item) accept(item.getAsFile(), 'paste')
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
@@ -37,7 +45,7 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
         onDrop={(e) => {
           e.preventDefault()
           setOver(false)
-          accept(e.dataTransfer.files[0])
+          accept(e.dataTransfer.files[0], 'drop')
         }}
         className="group relative block w-full max-w-3xl border border-dashed px-8 py-24 text-center transition-colors duration-200 cursor-pointer"
         style={{
@@ -52,7 +60,7 @@ export default function Dropzone({ onFile }: { onFile: (file: File) => void }) {
           className="sr-only"
           aria-label="Upload an image"
           onChange={(e) => {
-            accept(e.target.files?.[0])
+            accept(e.target.files?.[0], 'click')
             e.target.value = ''
           }}
         />
