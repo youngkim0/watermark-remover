@@ -154,22 +154,26 @@ async function runModel(
   return results[session.outputNames[0]].data as Uint8Array
 }
 
+/** Inpainted crop region: paste `data` at (x, y) on the source canvas. */
+export type InpaintPatch = { x: number; y: number; data: ImageData }
+
 /**
- * Erase the masked region of `image` and return the inpainted result.
- * `mask` is one byte per pixel (width*height), 255 = erase, 0 = keep
- * (inverted to the model's convention internally).
+ * Erase the masked region of `image` and return only the affected crop as a
+ * patch (full-frame copies of camera photos are ~50MB — enough to OOM-kill
+ * mobile tabs). `mask` is one byte per pixel (width*height), 255 = erase,
+ * 0 = keep (inverted to the model's convention internally). Returns null
+ * when the mask is empty.
  */
 export async function inpaint(
   image: ImageData,
   mask: Uint8Array,
   onProgress?: ProgressFn
-): Promise<ImageData> {
+): Promise<InpaintPatch | null> {
   const { width, height, data } = image
   if (mask.length !== width * height) throw new Error('Mask size does not match image')
 
   const bbox = maskBBox(mask, width, height)
-  const out = new Uint8ClampedArray(data) // start from the original
-  if (!bbox) return new ImageData(out, width, height)
+  if (!bbox) return null
 
   const crop = computeCrop(bbox, width, height)
 
@@ -186,16 +190,12 @@ export async function inpaint(
 
   const result = await runModel(cropRgba, cropMask, crop.w, crop.h, onProgress)
 
-  // Paste only masked pixels back (the model returns the input elsewhere).
-  for (let y = 0; y < crop.h; y++) {
-    for (let x = 0; x < crop.w; x++) {
-      const ci = y * crop.w + x
-      if (!cropMask[ci]) continue
-      const gi = (crop.y + y) * width + (crop.x + x)
-      out[gi * 4] = result[ci]
-      out[gi * 4 + 1] = result[cropSize + ci]
-      out[gi * 4 + 2] = result[2 * cropSize + ci]
-    }
+  // Paste only masked pixels onto the crop (the model returns the input elsewhere).
+  for (let i = 0; i < cropSize; i++) {
+    if (!cropMask[i]) continue
+    cropRgba[i * 4] = result[i]
+    cropRgba[i * 4 + 1] = result[cropSize + i]
+    cropRgba[i * 4 + 2] = result[2 * cropSize + i]
   }
-  return new ImageData(out, width, height)
+  return { x: crop.x, y: crop.y, data: new ImageData(cropRgba, crop.w, crop.h) }
 }

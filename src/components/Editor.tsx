@@ -1,10 +1,17 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { inpaint, preloadModel, type InpaintProgress } from '@/lib/inpaint'
+import { inpaint, preloadModel, type InpaintPatch, type InpaintProgress } from '@/lib/inpaint'
+import { track } from '@/lib/analytics'
 
 const MAX_SIDE = 4096
+// iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
+const MAX_AREA = 14_000_000
 const MAX_UNDO = 30
+// Total bytes of erase-undo pixel data to retain. Mobile tabs are killed by
+// the OS at a few hundred MB, so cap well below that.
+const MAX_UNDO_BYTES = 96 * 1024 * 1024
+const MASK_COLOR = '#e8a33d'
 
 type ModelStatus =
   | { state: 'loading'; pct: number | null }
@@ -12,6 +19,13 @@ type ModelStatus =
   | { state: 'error' }
 
 type Dims = { w: number; h: number }
+
+// Mask undo is stroke replay, not pixel snapshots: a full-res ImageData per
+// stroke is ~50MB for a camera photo, which OOM-kills mobile tabs in a few
+// strokes. Stroke vectors are a few KB and redraw in microseconds.
+type MaskStroke =
+  | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
+  | { kind: 'corner' }
 
 function fitContain(img: Dims, box: Dims): Dims {
   const scale = Math.min(box.w / img.w, box.h / img.h, 1)
@@ -31,8 +45,8 @@ export default function Editor({
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
-  const maskUndoStack = useRef<ImageData[]>([])
-  const eraseHistory = useRef<ImageData[]>([])
+  const maskStrokes = useRef<MaskStroke[]>([])
+  const eraseHistory = useRef<InpaintPatch[]>([])
   const busyRef = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
@@ -57,9 +71,18 @@ export default function Editor({
   // Warm the model while the user is still brushing.
   useEffect(() => {
     let alive = true
+    const t0 = performance.now()
     preloadModel(onModelProgress)
-      .then(() => alive && setModel({ state: 'ready' }))
-      .catch(() => alive && setModel({ state: 'error' }))
+      .then(() => {
+        if (!alive) return
+        setModel({ state: 'ready' })
+        track('model-loaded', { ms: Math.round(performance.now() - t0) })
+      })
+      .catch(() => {
+        if (!alive) return
+        setModel({ state: 'error' })
+        track('model-error')
+      })
     return () => {
       alive = false
     }
@@ -71,7 +94,11 @@ export default function Editor({
     ;(async () => {
       try {
         const bmp = await createImageBitmap(file)
-        const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height))
+        const scale = Math.min(
+          1,
+          MAX_SIDE / Math.max(bmp.width, bmp.height),
+          Math.sqrt(MAX_AREA / (bmp.width * bmp.height))
+        )
         const w = Math.round(bmp.width * scale)
         const h = Math.round(bmp.height * scale)
         if (!alive) return
@@ -86,14 +113,17 @@ export default function Editor({
             .drawImage(bmp, 0, 0, w, h)
         }
         bmp.close()
-        maskUndoStack.current = []
+        maskStrokes.current = []
         eraseHistory.current = []
         setMaskActions(0)
         setEraseCount(0)
         setError(null)
         setDims({ w, h })
       } catch {
-        if (alive) setError('Could not read that image.')
+        if (alive) {
+          setError('Could not read that image.')
+          track('image-error')
+        }
       }
     })()
     return () => {
@@ -119,13 +149,6 @@ export default function Editor({
 
   const maskCtx = () => maskCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
 
-  const snapshotMask = () => {
-    if (!dims) return
-    const snap = maskCtx().getImageData(0, 0, dims.w, dims.h)
-    maskUndoStack.current.push(snap)
-    if (maskUndoStack.current.length > MAX_UNDO) maskUndoStack.current.shift()
-  }
-
   const toNatural = (e: React.PointerEvent) => {
     const rect = maskCanvasRef.current!.getBoundingClientRect()
     return {
@@ -134,13 +157,20 @@ export default function Editor({
     }
   }
 
-  const paintSegment = (x0: number, y0: number, x1: number, y1: number) => {
+  const paintDot = (x: number, y: number, width: number) => {
     const ctx = maskCtx()
-    ctx.strokeStyle = '#e8a33d'
-    ctx.fillStyle = '#e8a33d'
+    ctx.fillStyle = MASK_COLOR
+    ctx.beginPath()
+    ctx.arc(x, y, width / 2, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  const paintSegment = (x0: number, y0: number, x1: number, y1: number, width: number) => {
+    const ctx = maskCtx()
+    ctx.strokeStyle = MASK_COLOR
     ctx.lineCap = 'round'
     ctx.lineJoin = 'round'
-    ctx.lineWidth = brush * displayScale
+    ctx.lineWidth = width
     ctx.beginPath()
     ctx.moveTo(x0, y0)
     ctx.lineTo(x1, y1)
@@ -150,15 +180,12 @@ export default function Editor({
   const onPointerDown = (e: React.PointerEvent) => {
     if (busy || !dims) return
     e.currentTarget.setPointerCapture(e.pointerId)
-    snapshotMask()
     setMaskActions((n) => n + 1)
     const { x, y } = toNatural(e)
+    const width = brush * displayScale
+    maskStrokes.current.push({ kind: 'brush', width, points: [{ x, y }] })
     drawState.current = { active: true, x, y }
-    const ctx = maskCtx()
-    ctx.fillStyle = '#e8a33d'
-    ctx.beginPath()
-    ctx.arc(x, y, (brush * displayScale) / 2, 0, Math.PI * 2)
-    ctx.fill()
+    paintDot(x, y, width)
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -166,7 +193,11 @@ export default function Editor({
     setCursor({ x: e.clientX - rect.left, y: e.clientY - rect.top })
     if (!drawState.current.active || busy || !dims) return
     const { x, y } = toNatural(e)
-    paintSegment(drawState.current.x, drawState.current.y, x, y)
+    const stroke = maskStrokes.current[maskStrokes.current.length - 1]
+    if (stroke?.kind === 'brush') {
+      stroke.points.push({ x, y })
+      paintSegment(drawState.current.x, drawState.current.y, x, y, stroke.width)
+    }
     drawState.current = { active: true, x, y }
   }
 
@@ -179,7 +210,7 @@ export default function Editor({
     const s = Math.round(Math.min(d.w, d.h) * 0.17)
     const margin = Math.round(Math.min(d.w, d.h) * 0.015)
     const ctx = maskCtx()
-    ctx.fillStyle = '#e8a33d'
+    ctx.fillStyle = MASK_COLOR
     ctx.beginPath()
     ctx.roundRect(d.w - s - margin, d.h - s - margin, s, s, s * 0.18)
     ctx.fill()
@@ -188,31 +219,50 @@ export default function Editor({
   /** One-tap corner mask (manual button). */
   const cornerPreset = () => {
     if (!dims || busy) return
-    snapshotMask()
+    maskStrokes.current.push({ kind: 'corner' })
     setMaskActions((n) => n + 1)
     paintCornerMask(dims)
+    track('corner-preset')
+  }
+
+  /** Rebuild the mask canvas from the stroke list (after an undo). */
+  const replayMask = (d: Dims) => {
+    maskCtx().clearRect(0, 0, d.w, d.h)
+    for (const s of maskStrokes.current) {
+      if (s.kind === 'corner') {
+        paintCornerMask(d)
+        continue
+      }
+      paintDot(s.points[0].x, s.points[0].y, s.width)
+      for (let i = 1; i < s.points.length; i++) {
+        paintSegment(s.points[i - 1].x, s.points[i - 1].y, s.points[i].x, s.points[i].y, s.width)
+      }
+    }
   }
 
   const undo = () => {
     if (busy || !dims) return
-    if (maskUndoStack.current.length > 0) {
-      const snap = maskUndoStack.current.pop()!
-      maskCtx().putImageData(snap, 0, 0)
+    if (maskStrokes.current.length > 0) {
+      maskStrokes.current.pop()
+      replayMask(dims)
       setMaskActions((n) => Math.max(0, n - 1))
+      track('undo')
       return
     }
     const prev = eraseHistory.current.pop()
     if (prev) {
-      imgCanvasRef.current!.getContext('2d')!.putImageData(prev, 0, 0)
+      imgCanvasRef.current!.getContext('2d')!.putImageData(prev.data, prev.x, prev.y)
       setEraseCount((n) => Math.max(0, n - 1))
+      track('undo')
     }
   }
 
   const clearMask = useCallback(() => {
     if (busy || !dims) return
     maskCtx().clearRect(0, 0, dims.w, dims.h)
-    maskUndoStack.current = []
+    maskStrokes.current = []
     setMaskActions(0)
+    track('clear-mask')
   }, [busy, dims])
 
   // Core erase: reconstructs whatever is painted on the mask canvas.
@@ -234,23 +284,35 @@ export default function Editor({
         }
       }
       if (painted === 0) return
+      const t0 = performance.now()
       const result = await inpaint(image, mask, onModelProgress)
+      track('erase', { count: eraseCount + 1, ms: Math.round(performance.now() - t0) })
       setModel({ state: 'ready' })
-      eraseHistory.current.push(image)
-      if (eraseHistory.current.length > MAX_UNDO) eraseHistory.current.shift()
-      imgCtx.putImageData(result, 0, 0)
+      if (result) {
+        const prior = imgCtx.getImageData(result.x, result.y, result.data.width, result.data.height)
+        eraseHistory.current.push({ x: result.x, y: result.y, data: prior })
+        let bytes = eraseHistory.current.reduce((n, p) => n + p.data.data.byteLength, 0)
+        while (
+          eraseHistory.current.length > MAX_UNDO ||
+          (bytes > MAX_UNDO_BYTES && eraseHistory.current.length > 1)
+        ) {
+          bytes -= eraseHistory.current.shift()!.data.data.byteLength
+        }
+        imgCtx.putImageData(result.data, result.x, result.y)
+      }
       maskCtx().clearRect(0, 0, dims.w, dims.h)
-      maskUndoStack.current = []
+      maskStrokes.current = []
       setMaskActions(0)
       setEraseCount((n) => n + 1)
     } catch (err) {
       console.error(err)
       setError('Inpainting failed — try a smaller image or reload.')
+      track('erase-error')
     } finally {
       busyRef.current = false
       setBusy(false)
     }
-  }, [dims, onModelProgress])
+  }, [dims, eraseCount, onModelProgress])
 
   const erase = useCallback(() => {
     if (maskActions === 0) return
@@ -258,6 +320,7 @@ export default function Editor({
   }, [maskActions, runErase])
 
   const download = () => {
+    track('download', { erases: eraseCount })
     const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
       b.toString(16).padStart(2, '0')
     ).join('')
@@ -281,7 +344,10 @@ export default function Editor({
         e.preventDefault()
         undo()
       }
-      if (e.key.toLowerCase() === 'c' && !e.metaKey && !e.ctrlKey) setComparing(true)
+      if (e.key.toLowerCase() === 'c' && !e.metaKey && !e.ctrlKey) {
+        if (!e.repeat) track('compare')
+        setComparing(true)
+      }
     }
     const up = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() === 'c') setComparing(false)
@@ -446,7 +512,10 @@ export default function Editor({
           className="ctrl label px-4 h-10 cursor-pointer select-none"
           data-active={comparing}
           disabled={eraseCount === 0}
-          onPointerDown={() => setComparing(true)}
+          onPointerDown={() => {
+            track('compare')
+            setComparing(true)
+          }}
           onPointerUp={() => setComparing(false)}
           onPointerLeave={() => setComparing(false)}
         >
@@ -460,7 +529,15 @@ export default function Editor({
         >
           save png
         </button>
-        <button type="button" className="ctrl label px-4 h-10 cursor-pointer" onClick={onReplace} disabled={busy}>
+        <button
+          type="button"
+          className="ctrl label px-4 h-10 cursor-pointer"
+          onClick={() => {
+            track('replace-image')
+            onReplace()
+          }}
+          disabled={busy}
+        >
           new image
         </button>
       </div>
