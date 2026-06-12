@@ -5,6 +5,7 @@
 // relative to the usual lama-cleaner convention.
 // onnxruntime-web is browser-only; load it lazily so SSR never touches it.
 import type { InferenceSession, Tensor } from 'onnxruntime-web'
+import { track } from '@/lib/analytics'
 
 type OrtModule = typeof import('onnxruntime-web/webgpu')
 
@@ -25,7 +26,18 @@ type ProgressFn = (p: InpaintProgress) => void
 
 let sessionPromise: Promise<InferenceSession> | null = null
 
+// ort-web's WebGPU EP is unsupported on iOS/WebKit (onnxruntime#22776):
+// session creation can succeed and then session.run() crashes the WebKit
+// content process — the page silently reloads, so no catch ever fires.
+// All iOS browsers are WebKit, and only Chromium-likes ship "Chrome/" in
+// the UA, so gate by engine rather than by navigator.gpu presence.
+function isWebKitEngine(): boolean {
+  const ua = navigator.userAgent
+  return /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)
+}
+
 async function hasWebGPU(): Promise<boolean> {
+  if (isWebKitEngine()) return false
   const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu
   if (!gpu) return false
   try {
@@ -69,12 +81,16 @@ async function createSession(onProgress?: ProgressFn): Promise<InferenceSession>
   onProgress?.({ stage: 'compile' })
   if (webgpu) {
     try {
-      return await ort.InferenceSession.create(buffer, { executionProviders: ['webgpu'] })
+      const session = await ort.InferenceSession.create(buffer, { executionProviders: ['webgpu'] })
+      track('model-ep', { ep: 'webgpu' })
+      return session
     } catch {
       // fall through to wasm
     }
   }
-  return ort.InferenceSession.create(buffer, { executionProviders: ['wasm'] })
+  const session = await ort.InferenceSession.create(buffer, { executionProviders: ['wasm'] })
+  track('model-ep', { ep: 'wasm' })
+  return session
 }
 
 function getSession(onProgress?: ProgressFn): Promise<InferenceSession> {
