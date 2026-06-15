@@ -8,7 +8,7 @@ import { USE_CASES, STEPS, REASONS, FAQ } from '@/lib/content'
 function Header({ onHome }: { onHome: () => void }) {
   return (
     <header
-      className="flex items-center justify-between px-6 py-4 border-b shrink-0"
+      className="flex items-center justify-between px-6 py-3 sm:py-4 border-b shrink-0"
       style={{ borderColor: 'var(--line)' }}
     >
       <button
@@ -24,10 +24,10 @@ function Header({ onHome }: { onHome: () => void }) {
   )
 }
 
-function Footer() {
+function Footer({ className = '' }: { className?: string }) {
   return (
     <footer
-      className="flex items-center justify-between px-6 py-3 border-t shrink-0"
+      className={`items-center justify-between px-6 py-3 border-t shrink-0 ${className}`}
       style={{ borderColor: 'var(--line)' }}
     >
       <span className="label text-ink-faint hidden sm:block">
@@ -65,7 +65,8 @@ export default function Home() {
       <main className="h-dvh flex flex-col">
         <Header onHome={closeFile} />
         <Editor key={`${file.name}-${file.lastModified}`} file={file} onReplace={closeFile} />
-        <Footer />
+        {/* Reclaim the footer's height for the image on phones. */}
+        <Footer className="hidden sm:flex" />
       </main>
     )
   }
@@ -151,7 +152,7 @@ export default function Home() {
         </div>
       </div>
 
-      <Footer />
+      <Footer className="flex" />
     </main>
   )
 }

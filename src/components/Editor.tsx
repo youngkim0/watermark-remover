@@ -176,7 +176,9 @@ export default function Editor({
     const el = stageRef.current
     const update = () => {
       const r = el.getBoundingClientRect()
-      setFit(fitContain(dims, { w: r.width - 48, h: r.height - 48 }))
+      // Tighter breathing room on phones so the image can claim the width.
+      const pad = window.innerWidth < 640 ? 16 : 48
+      setFit(fitContain(dims, { w: r.width - pad, h: r.height - pad }))
     }
     update()
     const ro = new ResizeObserver(update)
@@ -491,9 +493,9 @@ export default function Editor({
       </div>
 
       {/* status / error line */}
-      <div className="px-6 pb-2 flex justify-center">
+      <div className="px-6 pb-1.5 sm:pb-2 flex justify-center">
         <span
-          className="label"
+          className="label text-center"
           style={{
             color: error
               ? '#d96c47'
@@ -507,8 +509,8 @@ export default function Editor({
       </div>
 
       {/* toolbar */}
-      <div className="px-6 pb-6 flex flex-wrap items-center justify-center gap-2">
-        <div className="ctrl flex items-center gap-3 px-4 h-10">
+      <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+        <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
           <span className="label">brush</span>
           <input
             type="range"
@@ -516,16 +518,16 @@ export default function Editor({
             max={96}
             value={brush}
             onChange={(e) => setBrush(Number(e.target.value))}
-            className="w-24"
+            className="w-20 sm:w-24"
             aria-label="Brush size"
           />
         </div>
-        <button type="button" className="ctrl label px-4 h-10 cursor-pointer" onClick={cornerPreset} disabled={busy}>
+        <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={cornerPreset} disabled={busy}>
           ✦ corner
         </button>
         <button
           type="button"
-          className="ctrl label px-4 h-10 cursor-pointer"
+          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
           onClick={undo}
           disabled={busy || (maskActions === 0 && eraseCount === 0)}
         >
@@ -533,7 +535,7 @@ export default function Editor({
         </button>
         <button
           type="button"
-          className="ctrl label px-4 h-10 cursor-pointer"
+          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
           onClick={clearMask}
           disabled={busy || maskActions === 0}
         >
@@ -543,7 +545,7 @@ export default function Editor({
           type="button"
           onClick={erase}
           disabled={busy || maskActions === 0 || model.state === 'error'}
-          className="label px-7 h-10 cursor-pointer transition-colors duration-150 disabled:opacity-35 disabled:cursor-not-allowed"
+          className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer transition-colors duration-150 disabled:opacity-35 disabled:cursor-not-allowed"
           style={{
             background: 'var(--amber)',
             color: '#181612',
@@ -552,10 +554,10 @@ export default function Editor({
         >
           {busy ? 'working' : 'erase'}
         </button>
-        <span aria-hidden className="w-px h-6 mx-2" style={{ background: 'var(--line)' }} />
+        <span aria-hidden className="hidden sm:block w-px h-6 mx-2" style={{ background: 'var(--line)' }} />
         <button
           type="button"
-          className="ctrl label px-4 h-10 cursor-pointer select-none"
+          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer select-none"
           data-active={comparing}
           disabled={eraseCount === 0}
           onPointerDown={() => {
@@ -565,11 +567,11 @@ export default function Editor({
           onPointerUp={() => setComparing(false)}
           onPointerLeave={() => setComparing(false)}
         >
-          hold to compare
+          <span className="hidden sm:inline">hold to </span>compare
         </button>
         <button
           type="button"
-          className="ctrl label px-4 h-10 cursor-pointer"
+          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
           onClick={download}
           disabled={busy || eraseCount === 0}
         >
@@ -577,7 +579,7 @@ export default function Editor({
         </button>
         <button
           type="button"
-          className="ctrl label px-4 h-10 cursor-pointer"
+          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
           onClick={() => {
             track('replace-image')
             onReplace()
