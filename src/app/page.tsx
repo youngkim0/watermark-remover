@@ -33,7 +33,12 @@ function Footer({ className = '' }: { className?: string }) {
       <span className="label text-ink-faint hidden sm:block">
         mi-gan · onnx runtime · webgpu/wasm
       </span>
-      <span className="label text-ink-faint">© 2026 ezpz co.</span>
+      <span className="label text-ink-faint flex items-center gap-3">
+        <a href="mailto:ezpzco58@google.com" className="hover:text-ink-base">
+          ezpzco58@google.com
+        </a>
+        <span>© 2026 ezpz co.</span>
+      </span>
     </footer>
   )
 }
