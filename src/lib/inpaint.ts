@@ -163,6 +163,65 @@ export function computeCrop(bbox: Rect, w: number, h: number): Rect {
   return { x, y, w: cw, h: ch }
 }
 
+// Grow the binary mask by `r` px (square structuring element, separable max
+// filter). Watermarks carry anti-aliased edges, soft glows and drop shadows
+// that sit just outside the brushed strokes; reconstructing only the exact
+// mask leaves a faint halo of the mark. Dilating first erases the fringe too.
+function dilateMask(mask: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  if (r <= 0) return mask.slice()
+  const tmp = new Uint8Array(w * h)
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r)
+      const x1 = Math.min(w - 1, x + r)
+      let v = 0
+      for (let xx = x0; xx <= x1; xx++) if (mask[row + xx]) { v = 255; break }
+      tmp[row + x] = v
+    }
+  }
+  const out = new Uint8Array(w * h)
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - r)
+      const y1 = Math.min(h - 1, y + r)
+      let v = 0
+      for (let yy = y0; yy <= y1; yy++) if (tmp[yy * w + x]) { v = 255; break }
+      out[y * w + x] = v
+    }
+  }
+  return out
+}
+
+// Soft 0..1 alpha from a binary mask: a separable box blur run a few times
+// (≈ Gaussian) so the composite ramps across the mask edge instead of leaving
+// a hard, visible cut between the model's reconstruction and the real photo.
+function featherAlpha(mask: Uint8Array, w: number, h: number, r: number): Float32Array {
+  const a = new Float32Array(w * h)
+  for (let i = 0; i < a.length; i++) a[i] = mask[i] ? 1 : 0
+  if (r <= 0) return a
+  const win = r * 2 + 1
+  const tmp = new Float32Array(w * h)
+  for (let p = 0; p < 3; p++) {
+    for (let y = 0; y < h; y++) {
+      const row = y * w
+      for (let x = 0; x < w; x++) {
+        let s = 0
+        for (let k = -r; k <= r; k++) s += a[row + clamp(x + k, 0, w - 1)]
+        tmp[row + x] = s / win
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) {
+        let s = 0
+        for (let k = -r; k <= r; k++) s += tmp[clamp(y + k, 0, h - 1) * w + x]
+        a[y * w + x] = s / win
+      }
+    }
+  }
+  return a
+}
+
 async function runModel(
   rgba: Uint8ClampedArray,
   mask: Uint8Array,
@@ -225,14 +284,41 @@ export async function inpaint(
     cropMask.set(mask.subarray(srcRow, srcRow + crop.w), dstRow)
   }
 
-  const result = await runModel(cropRgba, cropMask, crop.w, crop.h, onProgress)
+  // Two dilations, scaled to the crop for size-independent results:
+  //  • `cover` = mask + `grow` px — the watermark plus its anti-aliased fringe,
+  //    glow and drop-shadow. This whole region must be fully reconstructed.
+  //  • `wide`  = cover + `feather` px — the model's hole, leaving a clean ring
+  //    around `cover` for the alpha ramp to land in.
+  // The feather then ramps the composite to 0 *outside* cover (never eroding
+  // it), so the seam blends into clean pixels while the mark is fully replaced.
+  const grow = Math.max(3, Math.round(Math.min(crop.w, crop.h) * 0.012))
+  const feather = Math.max(4, Math.round(Math.min(crop.w, crop.h) * 0.02))
+  const cover = dilateMask(cropMask, crop.w, crop.h, grow)
+  const wide = dilateMask(cropMask, crop.w, crop.h, grow + feather)
+  const alpha = featherAlpha(wide, crop.w, crop.h, feather)
+  // Force full opacity over cover so the mark is always completely replaced;
+  // alpha keeps its smooth outward ramp only in the clean ring beyond it.
+  for (let i = 0; i < cover.length; i++) if (cover[i]) alpha[i] = 1
 
-  // Paste only masked pixels onto the crop (the model returns the input elsewhere).
+  const result = await runModel(cropRgba, wide, crop.w, crop.h, onProgress)
+
+  // Feather-composite: full reconstruction deep inside the hole, ramping to the
+  // untouched photo across the seam (the model returns the input outside the
+  // hole, so the ramp blends reconstruction into real pixels — no hard edge).
   for (let i = 0; i < cropSize; i++) {
-    if (!cropMask[i]) continue
-    cropRgba[i * 4] = result[i]
-    cropRgba[i * 4 + 1] = result[cropSize + i]
-    cropRgba[i * 4 + 2] = result[2 * cropSize + i]
+    const a = alpha[i]
+    if (a <= 0) continue
+    const o = i * 4
+    if (a >= 0.999) {
+      cropRgba[o] = result[i]
+      cropRgba[o + 1] = result[cropSize + i]
+      cropRgba[o + 2] = result[2 * cropSize + i]
+    } else {
+      const inv = 1 - a
+      cropRgba[o] = Math.round(a * result[i] + inv * cropRgba[o])
+      cropRgba[o + 1] = Math.round(a * result[cropSize + i] + inv * cropRgba[o + 1])
+      cropRgba[o + 2] = Math.round(a * result[2 * cropSize + i] + inv * cropRgba[o + 2])
+    }
   }
   return { x: crop.x, y: crop.y, data: new ImageData(cropRgba, crop.w, crop.h) }
 }

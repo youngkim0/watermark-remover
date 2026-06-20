@@ -20,8 +20,11 @@ in your browser. Nothing is ever uploaded.
   `scripts/copy-ort.mjs` on `npm install`.
 - **Inference** — `src/lib/inpaint.ts` feeds the model raw `uint8` tensors
   (image `[1,3,H,W]` RGB + mask `[1,1,H,W]`, where mask `0` marks the hole)
-  on a ~512 px crop centered on the mask, then composites only the masked
-  pixels back into the original — full-resolution context, no global resampling.
+  on a ~512 px crop centered on the mask. The mask is first **dilated** a few
+  px so the watermark's anti-aliased fringe, glow and drop-shadow are
+  reconstructed too (no residual halo), and the result is **feather-composited**
+  back via a soft alpha ramp so the patch blends seamlessly into the photo
+  instead of leaving a hard seam — full-resolution context, no global resampling.
 - **UI** — Next.js App Router + Tailwind. One screen: canvas, brush,
   corner preset, undo, hold-to-compare, PNG export. Keyboard: `[` `]` brush
   size, `⌘Z` undo, hold `C` to compare.
