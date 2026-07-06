@@ -10,6 +10,7 @@ import {
   type Rect,
 } from '@/lib/inpaint'
 import { track } from '@/lib/analytics'
+import CropOverlay from './CropOverlay'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -33,6 +34,17 @@ type Dims = { w: number; h: number }
 type MaskStroke =
   | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
   | { kind: 'corner' }
+
+// Single-level crop undo: the full pre-crop image + original planes, plus the
+// erase-undo stack that was valid against them. Kept only when it fits under
+// MAX_UNDO_BYTES (two full planes + copied patches); otherwise a crop is final.
+type CropUndo = {
+  dims: Dims
+  image: ImageData
+  orig: ImageData
+  eraseHistory: InpaintPatch[]
+  eraseCountBefore: number
+}
 
 /** Bottom-right square where the ✦ watermark sits. */
 function cornerRect(d: Dims): Rect {
@@ -98,6 +110,11 @@ export default function Editor({
   const [model, setModel] = useState<ModelStatus>({ state: 'loading', pct: null })
   const [error, setError] = useState<string | null>(null)
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null)
+  const [cropping, setCropping] = useState(false)
+  const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
+  const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
+  const cropUndo = useRef<CropUndo | null>(null)
+  const [originalDims, setOriginalDims] = useState<Dims | null>(null)
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -154,6 +171,10 @@ export default function Editor({
         bmp.close()
         maskStrokes.current = []
         eraseHistory.current = []
+        cropUndo.current = null
+        setOriginalDims({ w, h })
+        setCropUndoAvailable(false)
+        setCropping(false)
         setMaskActions(0)
         setEraseCount(0)
         setError(null)
@@ -219,7 +240,7 @@ export default function Editor({
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (busy || !dims) return
+    if (busy || !dims || cropping) return
     e.currentTarget.setPointerCapture(e.pointerId)
     setMaskActions((n) => n + 1)
     const { x, y } = toNatural(e)
@@ -281,7 +302,7 @@ export default function Editor({
   }
 
   const undo = () => {
-    if (busy || !dims) return
+    if (busy || !dims || cropping) return
     if (maskStrokes.current.length > 0) {
       maskStrokes.current.pop()
       replayMask(dims)
@@ -293,6 +314,28 @@ export default function Editor({
     if (prev) {
       imgCanvasRef.current!.getContext('2d')!.putImageData(prev.data, prev.x, prev.y)
       setEraseCount((n) => Math.max(0, n - 1))
+      track('undo')
+      return
+    }
+    const c = cropUndo.current
+    if (c) {
+      for (const [canvas, snap] of [
+        [imgCanvasRef.current!, c.image],
+        [origCanvasRef.current!, c.orig],
+      ] as const) {
+        canvas.width = c.dims.w
+        canvas.height = c.dims.h
+        canvas.getContext('2d', { willReadFrequently: true })!.putImageData(snap, 0, 0)
+      }
+      maskCanvasRef.current!.width = c.dims.w
+      maskCanvasRef.current!.height = c.dims.h
+      maskStrokes.current = []
+      eraseHistory.current = c.eraseHistory
+      setMaskActions(0)
+      setEraseCount(c.eraseCountBefore)
+      setDims({ w: c.dims.w, h: c.dims.h })
+      cropUndo.current = null
+      setCropUndoAvailable(false)
       track('undo')
     }
   }
@@ -367,6 +410,80 @@ export default function Editor({
     void runErase()
   }, [maskActions, runErase])
 
+  const enterCrop = () => {
+    if (busy || !dims || maskActions !== 0) return
+    cropRectRef.current = { x: 0, y: 0, w: dims.w, h: dims.h }
+    setCropping(true)
+    track('crop-open')
+  }
+
+  const cancelCrop = () => {
+    setCropping(false)
+  }
+
+  const applyCrop = () => {
+    if (busy || !dims || maskActions !== 0) return
+    const rect = cropRectRef.current
+    // No-op guards: full-image or degenerate selection.
+    if (rect.w < 1 || rect.h < 1 || (rect.w >= dims.w && rect.h >= dims.h)) {
+      setCropping(false)
+      return
+    }
+
+    const imgCanvas = imgCanvasRef.current!
+    const origCanvas = origCanvasRef.current!
+    const maskCanvas = maskCanvasRef.current!
+    const imgCtx = imgCanvas.getContext('2d', { willReadFrequently: true })!
+    const origCtx = origCanvas.getContext('2d', { willReadFrequently: true })!
+
+    // Keep an undo snapshot only if the pre-crop pixels (two full planes) plus
+    // the current erase-undo stack fit under the shared memory cap. On large
+    // images this usually won't fit, so the crop is final — matching the
+    // editor's existing "don't retain full-frame pixels on mobile" policy.
+    const planeBytes = dims.w * dims.h * 4 * 2
+    const histBytes = eraseHistory.current.reduce((n, p) => n + p.data.data.byteLength, 0)
+    if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
+      cropUndo.current = {
+        dims: { w: dims.w, h: dims.h },
+        image: imgCtx.getImageData(0, 0, dims.w, dims.h),
+        orig: origCtx.getImageData(0, 0, dims.w, dims.h),
+        eraseHistory: eraseHistory.current.slice(),
+        eraseCountBefore: eraseCount,
+      }
+      setCropUndoAvailable(true)
+    } else {
+      cropUndo.current = null
+      setCropUndoAvailable(false)
+    }
+
+    // Crop each canvas via a scratch canvas — canvas-to-canvas drawImage, no
+    // extra full-frame JS array beyond the optional snapshot above.
+    const scratch = document.createElement('canvas')
+    scratch.width = rect.w
+    scratch.height = rect.h
+    const sctx = scratch.getContext('2d')!
+    for (const [canvas, ctx] of [
+      [imgCanvas, imgCtx],
+      [origCanvas, origCtx],
+    ] as const) {
+      sctx.clearRect(0, 0, rect.w, rect.h)
+      sctx.drawImage(canvas, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h)
+      canvas.width = rect.w
+      canvas.height = rect.h
+      ctx.drawImage(scratch, 0, 0)
+    }
+    maskCanvas.width = rect.w
+    maskCanvas.height = rect.h
+
+    maskStrokes.current = []
+    eraseHistory.current = []
+    setMaskActions(0)
+    setEraseCount(0)
+    setDims({ w: rect.w, h: rect.h })
+    setCropping(false)
+    track('crop', { w: rect.w, h: rect.h })
+  }
+
   const download = () => {
     track('download', { erases: eraseCount })
     const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
@@ -407,9 +524,17 @@ export default function Editor({
       window.removeEventListener('keyup', up)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, dims])
+  }, [busy, dims, cropping])
 
-  const status = busy
+  const hasEdit =
+    eraseCount > 0 ||
+    (dims !== null &&
+      originalDims !== null &&
+      (dims.w !== originalDims.w || dims.h !== originalDims.h))
+
+  const status = cropping
+    ? 'drag to select the area to keep'
+    : busy
     ? 'erasing…'
     : eraseCount > 0
       ? 'erased — brush over anything else, or save your image'
@@ -454,8 +579,17 @@ export default function Editor({
               setCursor(null)
             }}
           />
+          {cropping && dims && fit.w > 0 && (
+            <CropOverlay
+              natural={dims}
+              display={fit}
+              onChange={(r) => {
+                cropRectRef.current = r
+              }}
+            />
+          )}
           {/* brush cursor */}
-          {cursor && !busy && (
+          {cursor && !busy && !cropping && (
             <div
               aria-hidden
               className="absolute pointer-events-none rounded-full border"
@@ -509,86 +643,114 @@ export default function Editor({
       </div>
 
       {/* toolbar */}
-      <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
-        <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
-          <span className="label">brush</span>
-          <input
-            type="range"
-            min={8}
-            max={96}
-            value={brush}
-            onChange={(e) => setBrush(Number(e.target.value))}
-            className="w-20 sm:w-24"
-            aria-label="Brush size"
-          />
+      {cropping ? (
+        <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={cancelCrop}
+          >
+            cancel
+          </button>
+          <button
+            type="button"
+            onClick={applyCrop}
+            className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer transition-colors duration-150"
+            style={{ background: 'var(--amber)', color: '#181612', fontWeight: 500 }}
+          >
+            apply
+          </button>
         </div>
-        <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={cornerPreset} disabled={busy}>
-          ✦ corner
-        </button>
-        <button
-          type="button"
-          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
-          onClick={undo}
-          disabled={busy || (maskActions === 0 && eraseCount === 0)}
-        >
-          undo
-        </button>
-        <button
-          type="button"
-          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
-          onClick={clearMask}
-          disabled={busy || maskActions === 0}
-        >
-          clear
-        </button>
-        <button
-          type="button"
-          onClick={erase}
-          disabled={busy || maskActions === 0 || model.state === 'error'}
-          className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer transition-colors duration-150 disabled:opacity-35 disabled:cursor-not-allowed"
-          style={{
-            background: 'var(--amber)',
-            color: '#181612',
-            fontWeight: 500,
-          }}
-        >
-          {busy ? 'working' : 'erase'}
-        </button>
-        <span aria-hidden className="hidden sm:block w-px h-6 mx-2" style={{ background: 'var(--line)' }} />
-        <button
-          type="button"
-          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer select-none"
-          data-active={comparing}
-          disabled={eraseCount === 0}
-          onPointerDown={() => {
-            track('compare')
-            setComparing(true)
-          }}
-          onPointerUp={() => setComparing(false)}
-          onPointerLeave={() => setComparing(false)}
-        >
-          <span className="hidden sm:inline">hold to </span>compare
-        </button>
-        <button
-          type="button"
-          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
-          onClick={download}
-          disabled={busy || eraseCount === 0}
-        >
-          save png
-        </button>
-        <button
-          type="button"
-          className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
-          onClick={() => {
-            track('replace-image')
-            onReplace()
-          }}
-          disabled={busy}
-        >
-          new image
-        </button>
-      </div>
+      ) : (
+        <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+          <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
+            <span className="label">brush</span>
+            <input
+              type="range"
+              min={8}
+              max={96}
+              value={brush}
+              onChange={(e) => setBrush(Number(e.target.value))}
+              className="w-20 sm:w-24"
+              aria-label="Brush size"
+            />
+          </div>
+          <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={cornerPreset} disabled={busy}>
+            ✦ corner
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterCrop}
+            disabled={busy || maskActions !== 0}
+          >
+            cut
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={undo}
+            disabled={busy || (maskActions === 0 && eraseCount === 0 && !cropUndoAvailable)}
+          >
+            undo
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={clearMask}
+            disabled={busy || maskActions === 0}
+          >
+            clear
+          </button>
+          <button
+            type="button"
+            onClick={erase}
+            disabled={busy || maskActions === 0 || model.state === 'error'}
+            className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer transition-colors duration-150 disabled:opacity-35 disabled:cursor-not-allowed"
+            style={{
+              background: 'var(--amber)',
+              color: '#181612',
+              fontWeight: 500,
+            }}
+          >
+            {busy ? 'working' : 'erase'}
+          </button>
+          <span aria-hidden className="hidden sm:block w-px h-6 mx-2" style={{ background: 'var(--line)' }} />
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer select-none"
+            data-active={comparing}
+            disabled={!hasEdit}
+            onPointerDown={() => {
+              track('compare')
+              setComparing(true)
+            }}
+            onPointerUp={() => setComparing(false)}
+            onPointerLeave={() => setComparing(false)}
+          >
+            <span className="hidden sm:inline">hold to </span>compare
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={download}
+            disabled={busy || !hasEdit}
+          >
+            save png
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={() => {
+              track('replace-image')
+              onReplace()
+            }}
+            disabled={busy}
+          >
+            new image
+          </button>
+        </div>
+      )}
     </div>
   )
 }
