@@ -11,6 +11,8 @@ import {
 } from '@/lib/inpaint'
 import { track } from '@/lib/analytics'
 import CropOverlay from './CropOverlay'
+import ZoomControls from './ZoomControls'
+import { useViewTransform } from '@/lib/useViewTransform'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -94,6 +96,7 @@ export default function Editor({
   const imgCanvasRef = useRef<HTMLCanvasElement>(null)
   const origCanvasRef = useRef<HTMLCanvasElement>(null)
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
+  const imgBoxRef = useRef<HTMLDivElement>(null)
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskStrokes = useRef<MaskStroke[]>([])
@@ -109,7 +112,7 @@ export default function Editor({
   const [comparing, setComparing] = useState(false)
   const [model, setModel] = useState<ModelStatus>({ state: 'loading', pct: null })
   const [error, setError] = useState<string | null>(null)
-  const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null)
+  const [cursor, setCursor] = useState<{ x: number; y: number; z: number } | null>(null)
   const [cropping, setCropping] = useState(false)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
@@ -240,19 +243,28 @@ export default function Editor({
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
+    if (view.onPointerDown(e)) return // pinch / space-pan consumed the event
     if (busy || !dims || cropping) return
     e.currentTarget.setPointerCapture(e.pointerId)
     setMaskActions((n) => n + 1)
+    const rect = maskCanvasRef.current!.getBoundingClientRect()
     const { x, y } = toNatural(e)
-    const width = brush * displayScale
+    // Screen→natural ratio from the live (already-scaled) rect, so the brush
+    // paints a finer natural footprint when zoomed in.
+    const width = brush * (rect.width ? dims.w / rect.width : displayScale)
     maskStrokes.current.push({ kind: 'brush', width, points: [{ x, y }] })
     drawState.current = { active: true, x, y }
     paintDot(x, y, width)
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if (view.onPointerMove(e)) {
+      setCursor(null) // hide brush preview during a gesture
+      return
+    }
     const rect = maskCanvasRef.current!.getBoundingClientRect()
-    setCursor({ x: e.clientX - rect.left, y: e.clientY - rect.top })
+    const z = fit.w ? rect.width / fit.w : 1
+    setCursor({ x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z, z })
     if (!drawState.current.active || busy || !dims) return
     const { x, y } = toNatural(e)
     const stroke = maskStrokes.current[maskStrokes.current.length - 1]
@@ -266,6 +278,31 @@ export default function Editor({
   const endStroke = () => {
     drawState.current.active = false
   }
+
+  // Drop the in-progress brush stroke (used when a pinch starts mid-stroke).
+  const cancelStroke = () => {
+    if (!drawState.current.active) return
+    drawState.current.active = false
+    const last = maskStrokes.current[maskStrokes.current.length - 1]
+    if (last?.kind === 'brush') {
+      maskStrokes.current.pop()
+      setMaskActions((n) => Math.max(0, n - 1))
+      if (dims) replayMask(dims)
+    }
+  }
+
+  const view = useViewTransform({
+    containerRef: imgBoxRef,
+    fit,
+    enabled: !cropping,
+    onPinchStart: cancelStroke,
+  })
+
+  // Reset zoom/pan to fit whenever a new image is loaded.
+  useEffect(() => {
+    view.fit()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file])
 
   /** Paint a mask over the bottom-right corner where the ✦ watermark sits. */
   const paintCornerMask = (d: Dims) => {
@@ -553,8 +590,9 @@ export default function Editor({
       {/* stage */}
       <div ref={stageRef} className="relative flex-1 min-h-0 flex items-center justify-center">
         <div
+          ref={imgBoxRef}
           className="relative"
-          style={{ width: fit.w || undefined, height: fit.h || undefined, cursor: 'none' }}
+          style={{ width: fit.w || undefined, height: fit.h || undefined, willChange: 'transform' }}
         >
           <canvas
             ref={imgCanvasRef}
@@ -572,9 +610,16 @@ export default function Editor({
             style={{ opacity: comparing ? 0 : 0.5, transition: 'opacity 100ms' }}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
-            onPointerUp={endStroke}
-            onPointerCancel={endStroke}
-            onPointerLeave={() => {
+            onPointerUp={(e) => {
+              view.onPointerUp(e)
+              endStroke()
+            }}
+            onPointerCancel={(e) => {
+              view.onPointerUp(e)
+              endStroke()
+            }}
+            onPointerLeave={(e) => {
+              view.onPointerUp(e)
               endStroke()
               setCursor(null)
             }}
@@ -588,16 +633,17 @@ export default function Editor({
               }}
             />
           )}
-          {/* brush cursor */}
+          {/* brush cursor — sized in the container's local space so it stays a
+              constant on-screen size after the transform scales it. */}
           {cursor && !busy && !cropping && (
             <div
               aria-hidden
               className="absolute pointer-events-none rounded-full border"
               style={{
-                left: cursor.x - brush / 2,
-                top: cursor.y - brush / 2,
-                width: brush,
-                height: brush,
+                left: cursor.x - brush / cursor.z / 2,
+                top: cursor.y - brush / cursor.z / 2,
+                width: brush / cursor.z,
+                height: brush / cursor.z,
                 borderColor: 'var(--amber)',
                 background: 'rgba(232,163,61,0.12)',
               }}
@@ -615,6 +661,14 @@ export default function Editor({
             </div>
           )}
         </div>
+        {!cropping && view.zoomPct > 100 && (
+          <ZoomControls
+            pct={view.zoomPct}
+            onZoomOut={view.zoomOut}
+            onZoomIn={view.zoomIn}
+            onFit={view.fit}
+          />
+        )}
         {/* indeterminate bar while busy */}
         {busy && (
           <div className="absolute top-0 left-0 right-0 h-px overflow-hidden">

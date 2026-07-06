@@ -160,7 +160,11 @@ export function useViewTransform({
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
 
     if (spaceHeld.current) {
-      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+      try {
+        ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+      } catch {
+        // Pointer may already be released; panning still works without capture.
+      }
       panDrag.current = { x: e.clientX, y: e.clientY }
       if (containerRef.current) containerRef.current.style.cursor = 'grabbing'
       return true
