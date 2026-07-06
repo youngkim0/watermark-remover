@@ -15,15 +15,31 @@ type DragMode =
   | { kind: 'move' }
   | { kind: 'resize'; ex: -1 | 0 | 1; ey: -1 | 0 | 1 }
 
-const HANDLES: { ex: -1 | 0 | 1; ey: -1 | 0 | 1; cursor: string }[] = [
+// Boundaries are grabbed via large invisible hit areas so a fingertip can land
+// them easily; the visible marks (corner squares, edge bars) stay small. Edge
+// bands run the full length of each side, so you can drag anywhere on an edge,
+// not just its midpoint.
+const CORNER_HIT = 44 // px touch target centered on each corner
+const EDGE_BAND = 26 // px thickness of the draggable band along each edge
+
+const CORNERS: { ex: -1 | 1; ey: -1 | 1; cursor: string }[] = [
   { ex: -1, ey: -1, cursor: 'nwse-resize' },
-  { ex: 0, ey: -1, cursor: 'ns-resize' },
   { ex: 1, ey: -1, cursor: 'nesw-resize' },
-  { ex: -1, ey: 0, cursor: 'ew-resize' },
-  { ex: 1, ey: 0, cursor: 'ew-resize' },
   { ex: -1, ey: 1, cursor: 'nesw-resize' },
-  { ex: 0, ey: 1, cursor: 'ns-resize' },
   { ex: 1, ey: 1, cursor: 'nwse-resize' },
+]
+
+const EDGES: {
+  ex: -1 | 0 | 1
+  ey: -1 | 0 | 1
+  cursor: string
+  band: React.CSSProperties
+  bar: React.CSSProperties
+}[] = [
+  { ex: 0, ey: -1, cursor: 'ns-resize', band: { left: EDGE_BAND, right: EDGE_BAND, top: -EDGE_BAND / 2, height: EDGE_BAND }, bar: { width: 22, height: 3 } },
+  { ex: 0, ey: 1, cursor: 'ns-resize', band: { left: EDGE_BAND, right: EDGE_BAND, bottom: -EDGE_BAND / 2, height: EDGE_BAND }, bar: { width: 22, height: 3 } },
+  { ex: -1, ey: 0, cursor: 'ew-resize', band: { top: EDGE_BAND, bottom: EDGE_BAND, left: -EDGE_BAND / 2, width: EDGE_BAND }, bar: { width: 3, height: 22 } },
+  { ex: 1, ey: 0, cursor: 'ew-resize', band: { top: EDGE_BAND, bottom: EDGE_BAND, right: -EDGE_BAND / 2, width: EDGE_BAND }, bar: { width: 3, height: 22 } },
 ]
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi))
@@ -153,24 +169,54 @@ export default function CropOverlay({
         }}
         onPointerDown={(e) => beginDrag(e, { kind: 'move' })}
       >
-        {HANDLES.map((hd, i) => (
+        {/* Edge bands: drag anywhere along a side. Rendered before corners so
+            the corner hit areas win where they overlap. */}
+        {EDGES.map((ed, i) => (
           <div
-            key={i}
-            onPointerDown={(e) => beginDrag(e, { kind: 'resize', ex: hd.ex, ey: hd.ey })}
+            key={`e${i}`}
+            onPointerDown={(e) => beginDrag(e, { kind: 'resize', ex: ed.ex, ey: ed.ey })}
             style={{
               position: 'absolute',
-              left: `${((hd.ex + 1) / 2) * 100}%`,
-              top: `${((hd.ey + 1) / 2) * 100}%`,
-              width: 14,
-              height: 14,
-              transform: 'translate(-50%, -50%)',
-              background: 'var(--amber)',
-              border: '1px solid #181612',
-              borderRadius: 2,
-              cursor: hd.cursor,
+              ...ed.band,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: ed.cursor,
               touchAction: 'none',
             }}
-          />
+          >
+            <span style={{ ...ed.bar, background: 'var(--amber)', borderRadius: 2 }} />
+          </div>
+        ))}
+        {/* Corners: large touch target, small visible square. */}
+        {CORNERS.map((cn, i) => (
+          <div
+            key={`c${i}`}
+            onPointerDown={(e) => beginDrag(e, { kind: 'resize', ex: cn.ex, ey: cn.ey })}
+            style={{
+              position: 'absolute',
+              left: `${((cn.ex + 1) / 2) * 100}%`,
+              top: `${((cn.ey + 1) / 2) * 100}%`,
+              width: CORNER_HIT,
+              height: CORNER_HIT,
+              transform: 'translate(-50%, -50%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: cn.cursor,
+              touchAction: 'none',
+            }}
+          >
+            <span
+              style={{
+                width: 16,
+                height: 16,
+                background: 'var(--amber)',
+                border: '2px solid #181612',
+                borderRadius: 3,
+              }}
+            />
+          </div>
         ))}
       </div>
     </div>
