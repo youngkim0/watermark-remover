@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import Dropzone from '@/components/Dropzone'
 import Editor from '@/components/Editor'
-import { USE_CASES, STEPS, REASONS, FAQ } from '@/lib/content'
+import { USE_CASES, STEPS, REASONS, FAQ, VERSION } from '@/lib/content'
 
 function Header({ onHome }: { onHome: () => void }) {
   return (
@@ -38,6 +38,7 @@ function Footer({ className = '' }: { className?: string }) {
           ezpzco58@google.com
         </a>
         <span>© 2026 ezpz co.</span>
+        <span className="tabular-nums">{VERSION}</span>
       </span>
     </footer>
   )
