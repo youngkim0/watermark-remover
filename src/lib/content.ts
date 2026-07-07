@@ -10,7 +10,7 @@ export const TAGLINE = 'Free AI watermark remover & magic eraser — in your bro
 export const USE_CASES: { title: string; body: string }[] = [
   {
     title: 'AI watermarks',
-    body: 'The ✦ sparkle that Gemini, Nano Banana and other generators stamp on images — gone in one tap.',
+    body: 'The ✦ sparkle that Gemini, Nano Banana and other generators stamp on images — found and erased automatically.',
   },
   {
     title: 'Objects & clutter',
@@ -43,7 +43,7 @@ export const STEPS: { n: string; title: string; body: string }[] = [
   {
     n: '02',
     title: 'Erase what you don’t want',
-    body: 'Tap the corner preset for a watermark, or brush over any object, person or text. Press erase and the model rebuilds the background behind it.',
+    body: 'Tap ✦ detect and the watermark is found and masked for you — or brush over any object, person or text. Press erase and the model rebuilds the background behind it.',
   },
   {
     n: '03',
@@ -74,7 +74,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: 'Can Unmark remove objects and people, not just watermarks?',
-    a: 'Yes — Unmark is a full magic eraser. Brush over any object, person, sign, text or blemish and the model reconstructs the background behind it. Removing the corner watermark is just the one-tap default.',
+    a: 'Yes — Unmark is a full magic eraser. Brush over any object, person, sign, text or blemish and the model reconstructs the background behind it. Detecting and removing the AI watermark is just the one-tap default.',
   },
   {
     q: 'Are my images uploaded anywhere?',

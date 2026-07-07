@@ -10,6 +10,7 @@ import {
   type Rect,
 } from '@/lib/inpaint'
 import { track } from '@/lib/analytics'
+import { detectMarks } from '@/lib/detect'
 import CropOverlay from './CropOverlay'
 import ZoomControls from './ZoomControls'
 import { useViewTransform } from '@/lib/useViewTransform'
@@ -35,7 +36,7 @@ type Dims = { w: number; h: number }
 // strokes. Stroke vectors are a few KB and redraw in microseconds.
 type MaskStroke =
   | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
-  | { kind: 'corner' }
+  | { kind: 'detect'; rects: Rect[] }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // erase-undo stack that was valid against them. Kept only when it fits under
@@ -48,22 +49,16 @@ type CropUndo = {
   eraseCountBefore: number
 }
 
-/** Bottom-right square where the ✦ watermark sits. */
-function cornerRect(d: Dims): Rect {
-  const s = Math.round(Math.min(d.w, d.h) * 0.17)
-  const margin = Math.round(Math.min(d.w, d.h) * 0.015)
-  return { x: d.w - s - margin, y: d.h - s - margin, w: s, h: s }
-}
-
 /** Bounding box of everything painted, from stroke geometry — avoids
  *  reading full-resolution pixel data to find the mask. */
 function strokesBBox(strokes: MaskStroke[], d: Dims): Rect | null {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
   for (const s of strokes) {
-    if (s.kind === 'corner') {
-      const r = cornerRect(d)
-      x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y)
-      x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h)
+    if (s.kind === 'detect') {
+      for (const r of s.rects) {
+        x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y)
+        x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h)
+      }
     } else {
       const r = s.width / 2 + 1
       for (const pt of s.points) {
@@ -114,6 +109,7 @@ export default function Editor({
   const [error, setError] = useState<string | null>(null)
   const [cursor, setCursor] = useState<{ x: number; y: number; z: number } | null>(null)
   const [cropping, setCropping] = useState(false)
+  const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
   const cropUndo = useRef<CropUndo | null>(null)
@@ -178,6 +174,7 @@ export default function Editor({
         setOriginalDims({ w, h })
         setCropUndoAvailable(false)
         setCropping(false)
+        setDetectResult(null)
         setMaskActions(0)
         setEraseCount(0)
         setError(null)
@@ -248,6 +245,7 @@ export default function Editor({
     if (view.onPointerDown(e)) return // pinch / space-pan consumed the event
     if (busy || !dims || cropping) return
     e.currentTarget.setPointerCapture(e.pointerId)
+    setDetectResult(null)
     setMaskActions((n) => n + 1)
     const rect = maskCanvasRef.current!.getBoundingClientRect()
     const { x, y } = toNatural(e)
@@ -306,31 +304,62 @@ export default function Editor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file])
 
-  /** Paint a mask over the bottom-right corner where the ✦ watermark sits. */
-  const paintCornerMask = (d: Dims) => {
-    const r = cornerRect(d)
+  /** Paint the mask over detected watermark regions. */
+  const paintDetect = (rects: Rect[]) => {
     const ctx = maskCtx()
     ctx.fillStyle = MASK_COLOR
-    ctx.beginPath()
-    ctx.roundRect(r.x, r.y, r.w, r.h, r.w * 0.18)
-    ctx.fill()
+    for (const r of rects) {
+      ctx.beginPath()
+      ctx.roundRect(r.x, r.y, r.w, r.h, Math.min(r.w, r.h) * 0.18)
+      ctx.fill()
+    }
   }
 
-  /** One-tap corner mask (manual button). */
-  const cornerPreset = () => {
-    if (!dims || busy) return
-    maskStrokes.current.push({ kind: 'corner' })
+  /** Find known AI watermarks and pre-paint the mask over them.
+   *  Returns the number of marks found. */
+  const runDetect = async (auto: boolean): Promise<number> => {
+    if (!dims || busyRef.current) return 0
+    const t0 = performance.now()
+    const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+    const marks = await detectMarks(imgCtx.getImageData(0, 0, dims.w, dims.h))
+    track('detect', { found: marks.length, ms: Math.round(performance.now() - t0), auto })
+    if (marks.length === 0) return 0
+    if (!imgCanvasRef.current) return 0
+    maskStrokes.current.push({ kind: 'detect', rects: marks.map((m) => m.rect) })
     setMaskActions((n) => n + 1)
-    paintCornerMask(dims)
-    track('corner-preset')
+    paintDetect(marks.map((m) => m.rect))
+    return marks.length
   }
+
+  const detectPressed = async () => {
+    if (busy || !dims || cropping) return
+    const n = await runDetect(false)
+    setDetectResult(n > 0 ? 'found' : 'none')
+  }
+
+  // Auto-detect once per opened image; silent when nothing is found. Skips
+  // if the user already started working (brush/crop/erase) before results.
+  useEffect(() => {
+    if (!dims) return
+    let alive = true
+    ;(async () => {
+      if (maskStrokes.current.length > 0 || eraseCount > 0 || cropping) return
+      const n = await runDetect(true)
+      if (alive && n > 0) setDetectResult('found')
+    })()
+    return () => {
+      alive = false
+    }
+    // Re-run only when a new image (or crop) finishes sizing the canvas.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dims])
 
   /** Rebuild the mask canvas from the stroke list (after an undo). */
   const replayMask = (d: Dims) => {
     maskCtx().clearRect(0, 0, d.w, d.h)
     for (const s of maskStrokes.current) {
-      if (s.kind === 'corner') {
-        paintCornerMask(d)
+      if (s.kind === 'detect') {
+        paintDetect(s.rects)
         continue
       }
       paintDot(s.points[0].x, s.points[0].y, s.width)
@@ -346,6 +375,7 @@ export default function Editor({
       maskStrokes.current.pop()
       replayMask(dims)
       setMaskActions((n) => Math.max(0, n - 1))
+      setDetectResult(null)
       track('undo')
       return
     }
@@ -384,6 +414,7 @@ export default function Editor({
     maskCtx().clearRect(0, 0, dims.w, dims.h)
     maskStrokes.current = []
     setMaskActions(0)
+    setDetectResult(null)
     track('clear-mask')
   }, [busy, dims])
 
@@ -433,6 +464,7 @@ export default function Editor({
       maskCtx().clearRect(0, 0, dims.w, dims.h)
       maskStrokes.current = []
       setMaskActions(0)
+      setDetectResult(null)
       setEraseCount((n) => n + 1)
     } catch (err) {
       console.error(err)
@@ -575,17 +607,21 @@ export default function Editor({
     ? 'drag to select the area to keep'
     : busy
     ? 'erasing…'
-    : eraseCount > 0
-      ? 'erased — brush over anything else, or save your image'
-      : model.state === 'error'
-        ? 'model unavailable'
-        : model.state === 'ready'
-          ? 'tap ✦ corner for the watermark, or brush over anything — then erase'
-          : model.pct === null
-            ? 'loading model…'
-            : model.pct >= 1
-              ? 'compiling model…'
-              : `loading model ${Math.round(model.pct * 100)}%`
+    : detectResult === 'found'
+      ? 'watermark detected — press erase'
+      : detectResult === 'none'
+        ? 'no watermark detected — brush over it manually'
+        : eraseCount > 0
+          ? 'erased — brush over anything else, or save your image'
+          : model.state === 'error'
+            ? 'model unavailable'
+            : model.state === 'ready'
+              ? 'tap ✦ detect to find the watermark, or brush over anything — then erase'
+              : model.pct === null
+                ? 'loading model…'
+                : model.pct >= 1
+                  ? 'compiling model…'
+                  : `loading model ${Math.round(model.pct * 100)}%`
 
   return (
     <div className="flex-1 min-h-0 flex flex-col fade-up">
@@ -689,7 +725,7 @@ export default function Editor({
           style={{
             color: error
               ? '#d96c47'
-              : eraseCount > 0 && !busy
+              : (eraseCount > 0 || detectResult === 'found') && !busy
                 ? 'var(--amber)'
                 : 'var(--ink-faint)',
           }}
@@ -731,8 +767,8 @@ export default function Editor({
               aria-label="Brush size"
             />
           </div>
-          <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={cornerPreset} disabled={busy}>
-            ✦ corner
+          <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={detectPressed} disabled={busy}>
+            ✦ detect
           </button>
           <button
             type="button"

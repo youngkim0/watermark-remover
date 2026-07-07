@@ -87,7 +87,7 @@ const jsonLd = {
         "Magic eraser brush for any unwanted object",
         "Remove people, text, logos and timestamps from photos",
         "On-device processing — no uploads",
-        "Automatic corner watermark removal",
+        "Automatic AI watermark detection and removal",
       ],
     },
     {
