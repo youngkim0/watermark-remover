@@ -182,6 +182,8 @@ export default function Editor({
         setEraseCount(0)
         setError(null)
         setDims({ w, h })
+        // One count per image actually opened in the editor ("processed").
+        track('image-open', { w, h })
       } catch {
         if (alive) {
           setError('Could not read that image.')
