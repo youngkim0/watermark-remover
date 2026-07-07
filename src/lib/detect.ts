@@ -2,7 +2,8 @@ import type { Rect } from '@/lib/inpaint'
 
 export type DetectedMark = {
   rect: Rect // natural-image coords, padded, clamped
-  score: number // NCC in [0, 1]
+  score: number // blurred-edge NCC in [0, 1] (basin score)
+  sharp: number // unblurred-edge NCC at the same spot (shape verification)
   templateId: string
 }
 
@@ -11,15 +12,23 @@ export const DETECT_TUNING = {
   // Glyph size as a fraction of min(imageW, imageH). Real Gemini sample:
   // 0.0469. Range widened for crops/re-encodes.
   scaleRange: [0.03, 0.075] as [number, number],
-  scaleSteps: 4,
-  // Zero-mean NCC acceptance on edge maps. Biased for precision (no false
-  // paints).
-  nccThreshold: 0.4,
+  scaleSteps: 6,
+  // Acceptance cuts, placed from the measured joint score distribution
+  // (true glyphs: blur+sharp >= 1.28, worst lookalike: 1.12; see the plan's
+  // calibration record). Blurred NCC finds the basin; unblurred NCC verifies
+  // the sharp star shape; the sum separates the clusters.
+  nccThreshold: 0.6,
+  sharpThreshold: 0.45,
+  sumThreshold: 1.25,
   // The ✦ is a white overlay: glyph interior must be brighter than its
   // surround by at least this much (real sample: +13 on a light bg).
   minBrightnessDelta: 5,
   // Superellipse cusp exponent for the drawn star: |x|^p + |y|^p <= r^p.
-  starExponent: 0.6,
+  // Fitted against the real Gemini sample (NCC 0.95 at p=0.65 vs 0.77 at 0.6).
+  starExponent: 0.65,
+  // Saturate Sobel magnitudes at this value so strong content edges can't
+  // dominate the correlation variance and drown the faint overlay's edges.
+  edgeCap: 64,
   // Long side of the downscaled search image.
   searchSize: 768,
   // Padding added around an accepted glyph before inpainting.
@@ -96,10 +105,40 @@ function sobel(p: Plane): Plane {
         -data[i - w - 1] + data[i - w + 1] - 2 * data[i - 1] + 2 * data[i + 1] - data[i + w - 1] + data[i + w + 1]
       const gy =
         -data[i - w - 1] - 2 * data[i - w] - data[i - w + 1] + data[i + w - 1] + 2 * data[i + w] + data[i + w + 1]
-      out[i] = Math.hypot(gx, gy)
+      out[i] = Math.min(Math.hypot(gx, gy), DETECT_TUNING.edgeCap)
     }
   }
   return { data: out, w, h }
+}
+
+/** Separable box blur (radius r) — widens the correlation basin of thin edge
+ *  maps so the coarse sweep grid can't step over a match. */
+function boxBlur(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  if (r < 1) return src
+  const tmp = new Float32Array(w * h)
+  const out = new Float32Array(w * h)
+  const norm = 1 / (2 * r + 1)
+  for (let y = 0; y < h; y++) {
+    let acc = 0
+    for (let x = -r; x <= r; x++) acc += src[y * w + Math.min(w - 1, Math.max(0, x))]
+    for (let x = 0; x < w; x++) {
+      tmp[y * w + x] = acc * norm
+      const xOut = Math.max(0, x - r)
+      const xIn = Math.min(w - 1, x + r + 1)
+      acc += src[y * w + xIn] - src[y * w + xOut]
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let acc = 0
+    for (let y = -r; y <= r; y++) acc += tmp[Math.min(h - 1, Math.max(0, y)) * w + x]
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = acc * norm
+      const yOut = Math.max(0, y - r)
+      const yIn = Math.min(h - 1, y + r + 1)
+      acc += tmp[yIn * w + x] - tmp[yOut * w + x]
+    }
+  }
+  return out
 }
 
 /** Edge map of a template silhouette (gradient magnitude of the alpha). */
@@ -208,14 +247,17 @@ export async function detectMarks(image: ImageData): Promise<DetectedMark[]> {
         const size = Math.max(8, Math.round(minSide * frac))
         if (size >= minSide) continue
         const alpha = t.draw(size)
-        const tpl = templateEdges(alpha, size)
+        const blurR = Math.max(1, Math.round(size / 16))
+        const tplSharp = templateEdges(alpha, size)
+        const tpl = boxBlur(tplSharp, size, size, blurR)
+        const edgesB: Plane = { data: boxBlur(edges.data, edges.w, edges.h, blurR), w: edges.w, h: edges.h }
 
         // Coarse sweep.
         const coarse = Math.max(2, Math.round(size / 4))
         const candidates: { x: number; y: number; s: number }[] = []
         for (let y = 0; y + size < luma.h; y += coarse) {
           for (let x = 0; x + size < luma.w; x += coarse) {
-            const s = nccAt(edges, tpl, size, x, y, 2)
+            const s = nccAt(edgesB, tpl, size, x, y, 2)
             if (s > DETECT_TUNING.nccThreshold * 0.7) candidates.push({ x, y, s })
           }
         }
@@ -226,15 +268,19 @@ export async function detectMarks(image: ImageData): Promise<DetectedMark[]> {
           let best = { x: c.x, y: c.y, s: -1 }
           for (let y = Math.max(0, c.y - coarse); y <= Math.min(luma.h - size - 1, c.y + coarse); y += 1) {
             for (let x = Math.max(0, c.x - coarse); x <= Math.min(luma.w - size - 1, c.x + coarse); x += 1) {
-              const s = nccAt(edges, tpl, size, x, y, 1)
+              const s = nccAt(edgesB, tpl, size, x, y, 1)
               if (s > best.s) best = { x, y, s }
             }
           }
           if (best.s < DETECT_TUNING.nccThreshold) continue
+          const sharp = nccAt(edges, tplSharp, size, best.x, best.y, 1)
+          if (sharp < DETECT_TUNING.sharpThreshold) continue
+          if (best.s + sharp < DETECT_TUNING.sumThreshold) continue
           if (brightnessDelta(luma, alpha, size, best.x, best.y) < DETECT_TUNING.minBrightnessDelta) continue
           found.push({
             templateId: t.id,
             score: best.s,
+            sharp,
             size,
             x: best.x,
             y: best.y,
@@ -266,7 +312,7 @@ export async function detectMarks(image: ImageData): Promise<DetectedMark[]> {
       const y = Math.max(0, Math.round((f.y - pad) / scale))
       const w = Math.min(image.width - x, Math.round((f.size + 2 * pad) / scale))
       const h = Math.min(image.height - y, Math.round((f.size + 2 * pad) / scale))
-      return { rect: { x, y, w, h }, score: f.score, templateId: f.templateId }
+      return { rect: { x, y, w, h }, score: f.score, sharp: f.sharp, templateId: f.templateId }
     })
   } catch (err) {
     if (process.env.NODE_ENV !== 'production') console.error('detectMarks failed', err)
