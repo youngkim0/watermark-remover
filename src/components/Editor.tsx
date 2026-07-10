@@ -12,8 +12,11 @@ import {
 import { track } from '@/lib/analytics'
 import { detectMarks } from '@/lib/detect'
 import CropOverlay from './CropOverlay'
+import TextControls from './TextControls'
 import ZoomControls from './ZoomControls'
 import { useViewTransform } from '@/lib/useViewTransform'
+import { useTextTool } from '@/lib/useTextTool'
+import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -38,6 +41,10 @@ type MaskStroke =
   | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
   | { kind: 'detect'; rects: Rect[] }
 
+// One entry per erase action; an action may inpaint several clusters, each
+// contributing a patch. Undo restores a whole group (in reverse order).
+type PatchGroup = InpaintPatch[]
+
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // erase-undo stack that was valid against them. Kept only when it fits under
 // MAX_UNDO_BYTES (two full planes + copied patches); otherwise a crop is final.
@@ -45,35 +52,74 @@ type CropUndo = {
   dims: Dims
   image: ImageData
   orig: ImageData
-  eraseHistory: InpaintPatch[]
+  eraseHistory: PatchGroup[]
   eraseCountBefore: number
+  textItems: TextItem[]
 }
 
-/** Bounding box of everything painted, from stroke geometry — avoids
- *  reading full-resolution pixel data to find the mask. */
-function strokesBBox(strokes: MaskStroke[], d: Dims): Rect | null {
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+/** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
+ *  full-resolution pixel data to find the mask. Detect strokes contribute
+ *  one box per detected rect so distant marks can be clustered apart. */
+function strokeRects(strokes: MaskStroke[], d: Dims): Rect[] {
+  const out: Rect[] = []
+  const push = (x0: number, y0: number, x1: number, y1: number) => {
+    const cx = (v: number) => Math.min(Math.max(Math.round(v), 0), d.w)
+    const cy = (v: number) => Math.min(Math.max(Math.round(v), 0), d.h)
+    const bx = cx(x0), by = cy(y0)
+    const bw = cx(x1) - bx, bh = cy(y1) - by
+    if (bw > 0 && bh > 0) out.push({ x: bx, y: by, w: bw, h: bh })
+  }
   for (const s of strokes) {
     if (s.kind === 'detect') {
-      for (const r of s.rects) {
-        x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y)
-        x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h)
-      }
+      for (const r of s.rects) push(r.x, r.y, r.x + r.w, r.y + r.h)
     } else {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
       const r = s.width / 2 + 1
       for (const pt of s.points) {
         x0 = Math.min(x0, pt.x - r); y0 = Math.min(y0, pt.y - r)
         x1 = Math.max(x1, pt.x + r); y1 = Math.max(y1, pt.y + r)
       }
+      if (x1 >= x0) push(x0, y0, x1, y1)
     }
   }
-  if (x1 < x0) return null
-  const cx = (v: number) => Math.min(Math.max(Math.round(v), 0), d.w)
-  const cy = (v: number) => Math.min(Math.max(Math.round(v), 0), d.h)
-  const bx = cx(x0), by = cy(y0)
-  const bw = cx(x1) - bx, bh = cy(y1) - by
-  return bw > 0 && bh > 0 ? { x: bx, y: by, w: bw, h: bh } : null
+  return out
 }
+
+// Marks farther apart than this run as separate inpaints. The model works at
+// 512px internally, so one crop window spanning distant marks (e.g. detect
+// hits in opposite corners) would be heavily downscaled and paste back blurry.
+const CLUSTER_GAP = 192
+
+/** Merge boxes transitively while they come within `gap` of each other. */
+function clusterRects(rects: Rect[], gap: number): Rect[] {
+  const out = rects.map((r) => ({ ...r }))
+  for (let merged = true; merged; ) {
+    merged = false
+    outer: for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i], b = out[j]
+        if (
+          a.x - gap < b.x + b.w && b.x - gap < a.x + a.w &&
+          a.y - gap < b.y + b.h && b.y - gap < a.y + a.h
+        ) {
+          const x = Math.min(a.x, b.x)
+          const y = Math.min(a.y, b.y)
+          out[i] = {
+            x, y,
+            w: Math.max(a.x + a.w, b.x + b.w) - x,
+            h: Math.max(a.y + a.h, b.y + b.h) - y,
+          }
+          out.splice(j, 1)
+          merged = true
+          break outer
+        }
+      }
+    }
+  }
+  return out
+}
+
+const groupBytes = (g: PatchGroup) => g.reduce((n, p) => n + p.data.data.byteLength, 0)
 
 function fitContain(img: Dims, box: Dims): Dims {
   const scale = Math.min(box.w / img.w, box.h / img.h, 1)
@@ -91,11 +137,12 @@ export default function Editor({
   const imgCanvasRef = useRef<HTMLCanvasElement>(null)
   const origCanvasRef = useRef<HTMLCanvasElement>(null)
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
+  const textCanvasRef = useRef<HTMLCanvasElement>(null)
   const imgBoxRef = useRef<HTMLDivElement>(null)
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskStrokes = useRef<MaskStroke[]>([])
-  const eraseHistory = useRef<InpaintPatch[]>([])
+  const eraseHistory = useRef<PatchGroup[]>([])
   const busyRef = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
@@ -111,9 +158,13 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
+  const [tool, setTool] = useState<'erase' | 'text'>('erase')
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
   const cropUndo = useRef<CropUndo | null>(null)
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
+
+  const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
+  const { reset: resetText } = textTool
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -157,7 +208,7 @@ export default function Editor({
         const w = Math.round(bmp.width * scale)
         const h = Math.round(bmp.height * scale)
         if (!alive) return
-        for (const ref of [imgCanvasRef, origCanvasRef, maskCanvasRef]) {
+        for (const ref of [imgCanvasRef, origCanvasRef, maskCanvasRef, textCanvasRef]) {
           const c = ref.current!
           c.width = w
           c.height = h
@@ -171,6 +222,8 @@ export default function Editor({
         maskStrokes.current = []
         eraseHistory.current = []
         cropUndo.current = null
+        resetText()
+        setTool('erase')
         setOriginalDims({ w, h })
         setCropUndoAvailable(false)
         setCropping(false)
@@ -191,7 +244,7 @@ export default function Editor({
     return () => {
       alive = false
     }
-  }, [file])
+  }, [file, resetText])
 
   // Fit the canvas wrapper to the stage.
   useEffect(() => {
@@ -244,6 +297,10 @@ export default function Editor({
   const onPointerDown = (e: React.PointerEvent) => {
     if (view.onPointerDown(e)) return // pinch / space-pan consumed the event
     if (busy || !dims || cropping) return
+    if (tool === 'text') {
+      textTool.onPointerDown(e)
+      return
+    }
     e.currentTarget.setPointerCapture(e.pointerId)
     setDetectResult(null)
     setMaskActions((n) => n + 1)
@@ -262,6 +319,10 @@ export default function Editor({
       setCursor(null) // hide brush preview during a gesture
       return
     }
+    if (tool === 'text') {
+      textTool.onPointerMove(e)
+      return
+    }
     const rect = maskCanvasRef.current!.getBoundingClientRect()
     const z = fit.w ? rect.width / fit.w : 1
     setCursor({ x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z, z })
@@ -276,6 +337,7 @@ export default function Editor({
   }
 
   const endStroke = () => {
+    textTool.onPointerUp()
     drawState.current.active = false
   }
 
@@ -381,7 +443,10 @@ export default function Editor({
     }
     const prev = eraseHistory.current.pop()
     if (prev) {
-      imgCanvasRef.current!.getContext('2d')!.putImageData(prev.data, prev.x, prev.y)
+      const ctx = imgCanvasRef.current!.getContext('2d')!
+      for (let i = prev.length - 1; i >= 0; i--) {
+        ctx.putImageData(prev[i].data, prev[i].x, prev[i].y)
+      }
       setEraseCount((n) => Math.max(0, n - 1))
       track('undo')
       return
@@ -398,8 +463,11 @@ export default function Editor({
       }
       maskCanvasRef.current!.width = c.dims.w
       maskCanvasRef.current!.height = c.dims.h
+      textCanvasRef.current!.width = c.dims.w
+      textCanvasRef.current!.height = c.dims.h
       maskStrokes.current = []
       eraseHistory.current = c.eraseHistory
+      textTool.restore(c.textItems)
       setMaskActions(0)
       setEraseCount(c.eraseCountBefore)
       setDims({ w: c.dims.w, h: c.dims.h })
@@ -425,41 +493,56 @@ export default function Editor({
     setBusy(true)
     setError(null)
     try {
-      // Work on the crop window around the mask, never the full frame:
+      // Work on crop windows around the mask, never the full frame:
       // two full-res ImageData reads per erase (~100MB on a 12MP photo)
-      // are enough churn to get mobile tabs killed.
-      const bbox = strokesBBox(maskStrokes.current, dims)
-      if (!bbox) return
-      const crop = computeCrop(bbox, dims.w, dims.h)
+      // are enough churn to get mobile tabs killed. Distant marks run as
+      // separate clusters so each keeps a tight, near-native-res window.
+      const boxes = strokeRects(maskStrokes.current, dims)
+      if (boxes.length === 0) return
+      const clusters = clusterRects(boxes, CLUSTER_GAP)
       const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
-      const image = imgCtx.getImageData(crop.x, crop.y, crop.w, crop.h)
-      const maskData = maskCtx().getImageData(crop.x, crop.y, crop.w, crop.h)
-      const mask = new Uint8Array(crop.w * crop.h)
+      const t0 = performance.now()
+      const group: PatchGroup = []
       let painted = 0
-      for (let i = 0; i < mask.length; i++) {
-        if (maskData.data[i * 4 + 3] > 16) {
-          mask[i] = 255
-          painted++
+      for (const bbox of clusters) {
+        const crop = computeCrop(bbox, dims.w, dims.h)
+        const image = imgCtx.getImageData(crop.x, crop.y, crop.w, crop.h)
+        const maskData = maskCtx().getImageData(crop.x, crop.y, crop.w, crop.h)
+        const mask = new Uint8Array(crop.w * crop.h)
+        let clusterPainted = 0
+        for (let i = 0; i < mask.length; i++) {
+          if (maskData.data[i * 4 + 3] > 16) {
+            mask[i] = 255
+            clusterPainted++
+          }
+        }
+        painted += clusterPainted
+        if (clusterPainted === 0) continue
+        const result = await inpaint(image, mask, onModelProgress)
+        if (result) {
+          const ax = crop.x + result.x
+          const ay = crop.y + result.y
+          const prior = imgCtx.getImageData(ax, ay, result.data.width, result.data.height)
+          group.push({ x: ax, y: ay, data: prior })
+          imgCtx.putImageData(result.data, ax, ay)
         }
       }
       if (painted === 0) return
-      const t0 = performance.now()
-      const result = await inpaint(image, mask, onModelProgress)
-      track('erase', { count: eraseCount + 1, ms: Math.round(performance.now() - t0) })
+      track('erase', {
+        count: eraseCount + 1,
+        clusters: clusters.length,
+        ms: Math.round(performance.now() - t0),
+      })
       setModel({ state: 'ready' })
-      if (result) {
-        const ax = crop.x + result.x
-        const ay = crop.y + result.y
-        const prior = imgCtx.getImageData(ax, ay, result.data.width, result.data.height)
-        eraseHistory.current.push({ x: ax, y: ay, data: prior })
-        let bytes = eraseHistory.current.reduce((n, p) => n + p.data.data.byteLength, 0)
+      if (group.length > 0) {
+        eraseHistory.current.push(group)
+        let bytes = eraseHistory.current.reduce((n, g) => n + groupBytes(g), 0)
         while (
           eraseHistory.current.length > MAX_UNDO ||
           (bytes > MAX_UNDO_BYTES && eraseHistory.current.length > 1)
         ) {
-          bytes -= eraseHistory.current.shift()!.data.data.byteLength
+          bytes -= groupBytes(eraseHistory.current.shift()!)
         }
-        imgCtx.putImageData(result.data, ax, ay)
       }
       maskCtx().clearRect(0, 0, dims.w, dims.h)
       maskStrokes.current = []
@@ -488,6 +571,19 @@ export default function Editor({
     track('crop-open')
   }
 
+  const enterText = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    setTool('text')
+    if (textTool.items.length === 0) textTool.addItem()
+    track('text-open')
+  }
+
+  const exitText = () => {
+    textTool.deselect()
+    setTool('erase')
+  }
+
   const cancelCrop = () => {
     setCropping(false)
   }
@@ -512,7 +608,7 @@ export default function Editor({
     // images this usually won't fit, so the crop is final — matching the
     // editor's existing "don't retain full-frame pixels on mobile" policy.
     const planeBytes = dims.w * dims.h * 4 * 2
-    const histBytes = eraseHistory.current.reduce((n, p) => n + p.data.data.byteLength, 0)
+    const histBytes = eraseHistory.current.reduce((n, g) => n + groupBytes(g), 0)
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
         dims: { w: dims.w, h: dims.h },
@@ -520,6 +616,7 @@ export default function Editor({
         orig: origCtx.getImageData(0, 0, dims.w, dims.h),
         eraseHistory: eraseHistory.current.slice(),
         eraseCountBefore: eraseCount,
+        textItems: textTool.items,
       }
       setCropUndoAvailable(true)
     } else {
@@ -545,9 +642,12 @@ export default function Editor({
     }
     maskCanvas.width = rect.w
     maskCanvas.height = rect.h
+    textCanvasRef.current!.width = rect.w
+    textCanvasRef.current!.height = rect.h
 
     maskStrokes.current = []
     eraseHistory.current = []
+    textTool.applyCrop(rect)
     setMaskActions(0)
     setEraseCount(0)
     setDims({ w: rect.w, h: rect.h })
@@ -555,12 +655,25 @@ export default function Editor({
     track('crop', { w: rect.w, h: rect.h })
   }
 
-  const download = () => {
-    track('download', { erases: eraseCount })
+  const download = async () => {
+    track('download', { erases: eraseCount, texts: textTool.items.length })
     const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
       b.toString(16).padStart(2, '0')
     ).join('')
-    imgCanvasRef.current!.toBlob((blob) => {
+    let source: HTMLCanvasElement = imgCanvasRef.current!
+    if (textTool.items.length > 0) {
+      // Composite the text overlay into the export (it never touches the
+      // working canvas, so text stays editable after saving).
+      await loadFontsFor(textTool.items)
+      const scratch = document.createElement('canvas')
+      scratch.width = source.width
+      scratch.height = source.height
+      const ctx = scratch.getContext('2d')!
+      ctx.drawImage(source, 0, 0)
+      drawTextItems(ctx, textTool.items)
+      source = scratch
+    }
+    source.toBlob((blob) => {
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -574,6 +687,10 @@ export default function Editor({
   // Keyboard: [ ] brush size, cmd/ctrl+z undo, hold c to compare.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
+      // Never hijack keys while the user is typing (text-tool inputs).
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT')) return
+      if (tool !== 'erase') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
@@ -595,16 +712,23 @@ export default function Editor({
       window.removeEventListener('keyup', up)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, dims, cropping])
+  }, [busy, dims, cropping, tool])
 
   const hasEdit =
     eraseCount > 0 ||
+    textTool.items.length > 0 ||
     (dims !== null &&
       originalDims !== null &&
       (dims.w !== originalDims.w || dims.h !== originalDims.h))
 
   const status = cropping
     ? 'drag to select the area to keep'
+    : tool === 'text'
+    ? textTool.selected
+      ? 'drag the text to position it — style it below'
+      : textTool.items.length > 0
+        ? 'tap text on the image to edit, or add another'
+        : 'tap + add text to place a caption'
     : busy
     ? 'erasing…'
     : detectResult === 'found'
@@ -637,6 +761,8 @@ export default function Editor({
             className="absolute inset-0 w-full h-full"
             style={{ boxShadow: '0 24px 80px rgba(0,0,0,0.55)' }}
           />
+          {/* text overlay — under the compare plane so "original" hides it */}
+          <canvas ref={textCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
           <canvas
             ref={origCanvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-100"
@@ -671,9 +797,27 @@ export default function Editor({
               }}
             />
           )}
+          {/* text selection ring — in the container's local space, so it
+              tracks the item through zoom/pan like the canvases do. */}
+          {tool === 'text' && textTool.selected && dims && (() => {
+            const b = measureTextItem(textTool.selected)
+            return (
+              <div
+                aria-hidden
+                className="absolute pointer-events-none border border-dashed"
+                style={{
+                  left: b.x / displayScale - 4,
+                  top: b.y / displayScale - 4,
+                  width: b.w / displayScale + 8,
+                  height: b.h / displayScale + 8,
+                  borderColor: 'var(--amber-soft)',
+                }}
+              />
+            )
+          })()}
           {/* brush cursor — sized in the container's local space so it stays a
               constant on-screen size after the transform scales it. */}
-          {cursor && !busy && !cropping && (
+          {cursor && !busy && !cropping && tool === 'erase' && (
             <div
               aria-hidden
               className="absolute pointer-events-none rounded-full border"
@@ -753,6 +897,14 @@ export default function Editor({
             apply
           </button>
         </div>
+      ) : tool === 'text' ? (
+        <TextControls
+          selected={textTool.selected}
+          onUpdate={textTool.updateSelected}
+          onAdd={textTool.addItem}
+          onDelete={textTool.deleteSelected}
+          onDone={exitText}
+        />
       ) : (
         <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
           <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
@@ -777,6 +929,14 @@ export default function Editor({
             disabled={busy || maskActions !== 0}
           >
             cut
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterText}
+            disabled={busy}
+          >
+            text
           </button>
           <button
             type="button"

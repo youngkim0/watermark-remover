@@ -88,6 +88,7 @@ const jsonLd = {
         "Remove people, text, logos and timestamps from photos",
         "On-device processing — no uploads",
         "Automatic AI watermark detection and removal",
+        "Add text and captions in multiple styles, including Korean",
       ],
     },
     {
