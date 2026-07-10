@@ -144,6 +144,57 @@ function maskBBox(mask: Uint8Array, w: number, h: number): Rect | null {
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
 
+// Chebyshev dilation of a binary mask, separable (rows then columns).
+// Marks every pixel within `r` of a set pixel.
+function dilateMask(mask: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  const pass = (src: Uint8Array, stride: number, lineLen: number, lines: number) => {
+    const out = new Uint8Array(src.length)
+    for (let l = 0; l < lines; l++) {
+      const base = l * (stride === 1 ? lineLen : 1)
+      let dist = lineLen // distance to the nearest set pixel seen so far
+      for (let i = 0; i < lineLen; i++) {
+        const idx = base + i * stride
+        dist = src[idx] ? 0 : dist + 1
+        if (dist <= r) out[idx] = 255
+      }
+      dist = lineLen
+      for (let i = lineLen - 1; i >= 0; i--) {
+        const idx = base + i * stride
+        dist = src[idx] ? 0 : dist + 1
+        if (dist <= r) out[idx] = 255
+      }
+    }
+    return out
+  }
+  const rows = pass(mask, 1, w, h) // horizontal: stride 1, base = row * w
+  return pass(rows, w, h, w) // vertical: stride w, base = column index
+}
+
+// Separable box blur of a 0/255 mask into 0..255 alpha (linear ramp ~r wide).
+function blurMask(mask: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  const win = 2 * r + 1
+  const tmp = new Uint8Array(mask.length)
+  for (let y = 0; y < h; y++) {
+    const row = y * w
+    let sum = 0
+    for (let i = -r; i <= r; i++) sum += mask[row + clamp(i, 0, w - 1)]
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = Math.round(sum / win)
+      sum += mask[row + clamp(x + r + 1, 0, w - 1)] - mask[row + clamp(x - r, 0, w - 1)]
+    }
+  }
+  const out = new Uint8Array(mask.length)
+  for (let x = 0; x < w; x++) {
+    let sum = 0
+    for (let i = -r; i <= r; i++) sum += tmp[clamp(i, 0, h - 1) * w + x]
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = Math.round(sum / win)
+      sum += tmp[clamp(y + r + 1, 0, h - 1) * w + x] - tmp[clamp(y - r, 0, h - 1) * w + x]
+    }
+  }
+  return out
+}
+
 // The pipeline model resizes its input to 512px internally, so feeding the
 // full image inpaints small marks at reduced resolution. Instead run on a
 // ~512px context window centered on the mask and paste the result back.
@@ -225,14 +276,31 @@ export async function inpaint(
     cropMask.set(mask.subarray(srcRow, srcRow + crop.w), dstRow)
   }
 
-  const result = await runModel(cropRgba, cropMask, crop.w, crop.h, onProgress)
+  // Dilate the mask so the model regenerates the mark's anti-aliased fringe
+  // (undilated, those halo pixels survive as a ghost outline). Radius lands
+  // ~3px at the model's internal 512px working resolution.
+  const r = Math.max(3, Math.round((3 * Math.max(crop.w, crop.h)) / 512))
+  const dilated = dilateMask(cropMask, crop.w, crop.h, r)
 
-  // Paste only masked pixels onto the crop (the model returns the input elsewhere).
+  const result = await runModel(cropRgba, dilated, crop.w, crop.h, onProgress)
+
+  // Feathered paste-back: full replacement inside the dilated mask, fading
+  // to the original over a ~r-wide ring — a hard per-pixel paste leaves a
+  // visible seam at the mask boundary.
+  const alpha = blurMask(dilated, crop.w, crop.h, r)
   for (let i = 0; i < cropSize; i++) {
-    if (!cropMask[i]) continue
-    cropRgba[i * 4] = result[i]
-    cropRgba[i * 4 + 1] = result[cropSize + i]
-    cropRgba[i * 4 + 2] = result[2 * cropSize + i]
+    const a = dilated[i] ? 255 : alpha[i]
+    if (a === 0) continue
+    if (a === 255) {
+      cropRgba[i * 4] = result[i]
+      cropRgba[i * 4 + 1] = result[cropSize + i]
+      cropRgba[i * 4 + 2] = result[2 * cropSize + i]
+    } else {
+      const inv = 255 - a
+      cropRgba[i * 4] = (result[i] * a + cropRgba[i * 4] * inv + 127) / 255
+      cropRgba[i * 4 + 1] = (result[cropSize + i] * a + cropRgba[i * 4 + 1] * inv + 127) / 255
+      cropRgba[i * 4 + 2] = (result[2 * cropSize + i] * a + cropRgba[i * 4 + 2] * inv + 127) / 255
+    }
   }
   return { x: crop.x, y: crop.y, data: new ImageData(cropRgba, crop.w, crop.h) }
 }
