@@ -8,30 +8,44 @@ const SWATCHES = ['#ffffff', '#181612', '#e8a33d', '#d96c47', '#5b8bd9']
 /** Toolbar shown while the text tool is active. */
 export default function TextControls({
   selected,
+  editing,
   onUpdate,
   onAdd,
+  onEdit,
   onDelete,
   onDone,
 }: {
   selected: TextItem | null
+  editing: boolean
   onUpdate: (patch: Partial<TextItem>) => void
   onAdd: () => void
+  onEdit: () => void
   onDelete: () => void
   onDone: () => void
 }) {
   const font = selected ? fontById(selected.fontId) : null
   return (
-    <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+    <div
+      className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2"
+      // Keep button presses from stealing focus off the inline text editor
+      // (a blur would end the edit). Selects/inputs need real focus, so
+      // interacting with those intentionally commits the edit first.
+      onMouseDown={(e) => {
+        const t = e.target as HTMLElement
+        if (t.tagName !== 'SELECT' && t.tagName !== 'INPUT') e.preventDefault()
+      }}
+    >
       {selected && font ? (
         <>
-          <textarea
-            value={selected.text}
-            onChange={(e) => onUpdate({ text: e.target.value })}
-            rows={1}
-            className="ctrl px-3 py-2 h-9 sm:h-10 resize-none w-40 sm:w-52"
-            style={{ fontFamily: font.family, fontSize: 14, color: 'var(--ink)' }}
-            aria-label="Text content"
-          />
+          {!editing && (
+            <button
+              type="button"
+              className="ctrl label px-3 h-9 sm:h-10 cursor-pointer"
+              onClick={onEdit}
+            >
+              edit text
+            </button>
+          )}
           <select
             value={selected.fontId}
             onChange={(e) => {
@@ -105,7 +119,7 @@ export default function TextControls({
           </button>
         </>
       ) : (
-        <span className="label text-ink-faint px-2">tap text on the image to edit it</span>
+        <span className="label text-ink-faint px-2">tap text on the image to select it</span>
       )}
       <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={onAdd}>
         + add text

@@ -13,6 +13,7 @@ import { track } from '@/lib/analytics'
 import { detectMarks } from '@/lib/detect'
 import CropOverlay from './CropOverlay'
 import TextControls from './TextControls'
+import TextEditOverlay from './TextEditOverlay'
 import ZoomControls from './ZoomControls'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
@@ -41,9 +42,10 @@ type MaskStroke =
   | { kind: 'brush'; width: number; points: { x: number; y: number }[] }
   | { kind: 'detect'; rects: Rect[] }
 
-// One entry per erase action; an action may inpaint several clusters, each
-// contributing a patch. Undo restores a whole group (in reverse order).
-type PatchGroup = InpaintPatch[]
+// One entry per erase action; an action may inpaint several clusters (each
+// contributing a patch) and swallow text items brushed over. Undo restores
+// the whole entry: patches in reverse order, then the removed text.
+type EraseUndo = { patches: InpaintPatch[]; texts: TextItem[] }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // erase-undo stack that was valid against them. Kept only when it fits under
@@ -52,7 +54,7 @@ type CropUndo = {
   dims: Dims
   image: ImageData
   orig: ImageData
-  eraseHistory: PatchGroup[]
+  eraseHistory: EraseUndo[]
   eraseCountBefore: number
   textItems: TextItem[]
 }
@@ -119,7 +121,7 @@ function clusterRects(rects: Rect[], gap: number): Rect[] {
   return out
 }
 
-const groupBytes = (g: PatchGroup) => g.reduce((n, p) => n + p.data.data.byteLength, 0)
+const entryBytes = (g: EraseUndo) => g.patches.reduce((n, p) => n + p.data.data.byteLength, 0)
 
 function fitContain(img: Dims, box: Dims): Dims {
   const scale = Math.min(box.w / img.w, box.h / img.h, 1)
@@ -142,7 +144,7 @@ export default function Editor({
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskStrokes = useRef<MaskStroke[]>([])
-  const eraseHistory = useRef<PatchGroup[]>([])
+  const eraseHistory = useRef<EraseUndo[]>([])
   const busyRef = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
@@ -164,7 +166,7 @@ export default function Editor({
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
-  const { reset: resetText } = textTool
+  const { reset: resetText, removeCovered: removeCoveredText } = textTool
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -298,6 +300,11 @@ export default function Editor({
     if (view.onPointerDown(e)) return // pinch / space-pan consumed the event
     if (busy || !dims || cropping) return
     if (tool === 'text') {
+      // A tap outside the inline editor commits the in-progress edit (the
+      // editor stops propagation, so reaching here means "outside").
+      if (textTool.editing) {
+        ;(document.activeElement as HTMLElement | null)?.blur?.()
+      }
       textTool.onPointerDown(e)
       return
     }
@@ -444,9 +451,10 @@ export default function Editor({
     const prev = eraseHistory.current.pop()
     if (prev) {
       const ctx = imgCanvasRef.current!.getContext('2d')!
-      for (let i = prev.length - 1; i >= 0; i--) {
-        ctx.putImageData(prev[i].data, prev[i].x, prev[i].y)
+      for (let i = prev.patches.length - 1; i >= 0; i--) {
+        ctx.putImageData(prev.patches[i].data, prev.patches[i].x, prev.patches[i].y)
       }
+      textTool.addBack(prev.texts)
       setEraseCount((n) => Math.max(0, n - 1))
       track('undo')
       return
@@ -502,7 +510,7 @@ export default function Editor({
       const clusters = clusterRects(boxes, CLUSTER_GAP)
       const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
       const t0 = performance.now()
-      const group: PatchGroup = []
+      const patches: InpaintPatch[] = []
       let painted = 0
       for (const bbox of clusters) {
         const crop = computeCrop(bbox, dims.w, dims.h)
@@ -523,25 +531,30 @@ export default function Editor({
           const ax = crop.x + result.x
           const ay = crop.y + result.y
           const prior = imgCtx.getImageData(ax, ay, result.data.width, result.data.height)
-          group.push({ x: ax, y: ay, data: prior })
+          patches.push({ x: ax, y: ay, data: prior })
           imgCtx.putImageData(result.data, ax, ay)
         }
       }
       if (painted === 0) return
+      // Text items are an overlay, not image pixels — the inpaint above only
+      // rebuilds what's beneath them. Brushing over your own text means
+      // "erase the text", so drop items the mask majority-covers.
+      const removedTexts = removeCoveredText(clusters)
       track('erase', {
         count: eraseCount + 1,
         clusters: clusters.length,
+        texts: removedTexts.length,
         ms: Math.round(performance.now() - t0),
       })
       setModel({ state: 'ready' })
-      if (group.length > 0) {
-        eraseHistory.current.push(group)
-        let bytes = eraseHistory.current.reduce((n, g) => n + groupBytes(g), 0)
+      if (patches.length > 0 || removedTexts.length > 0) {
+        eraseHistory.current.push({ patches, texts: removedTexts })
+        let bytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
         while (
           eraseHistory.current.length > MAX_UNDO ||
           (bytes > MAX_UNDO_BYTES && eraseHistory.current.length > 1)
         ) {
-          bytes -= groupBytes(eraseHistory.current.shift()!)
+          bytes -= entryBytes(eraseHistory.current.shift()!)
         }
       }
       maskCtx().clearRect(0, 0, dims.w, dims.h)
@@ -557,7 +570,7 @@ export default function Editor({
       busyRef.current = false
       setBusy(false)
     }
-  }, [dims, eraseCount, onModelProgress])
+  }, [dims, eraseCount, onModelProgress, removeCoveredText])
 
   const erase = useCallback(() => {
     if (maskActions === 0) return
@@ -580,8 +593,18 @@ export default function Editor({
   }
 
   const exitText = () => {
+    // Commit any in-progress inline edit (blur fires its commit handler)
+    // before the overlay unmounts, so typed text isn't lost.
+    ;(document.activeElement as HTMLElement | null)?.blur?.()
     textTool.deselect()
     setTool('erase')
+  }
+
+  // Adding/switching items also goes through blur-first so the current
+  // inline edit commits before the editor moves to another item.
+  const addTextItem = () => {
+    ;(document.activeElement as HTMLElement | null)?.blur?.()
+    textTool.addItem()
   }
 
   const cancelCrop = () => {
@@ -608,7 +631,7 @@ export default function Editor({
     // images this usually won't fit, so the crop is final — matching the
     // editor's existing "don't retain full-frame pixels on mobile" policy.
     const planeBytes = dims.w * dims.h * 4 * 2
-    const histBytes = eraseHistory.current.reduce((n, g) => n + groupBytes(g), 0)
+    const histBytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
         dims: { w: dims.w, h: dims.h },
@@ -689,7 +712,11 @@ export default function Editor({
     const down = (e: KeyboardEvent) => {
       // Never hijack keys while the user is typing (text-tool inputs).
       const t = e.target as HTMLElement | null
-      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT')) return
+      if (
+        t &&
+        (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.isContentEditable)
+      )
+        return
       if (tool !== 'erase') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
@@ -724,11 +751,13 @@ export default function Editor({
   const status = cropping
     ? 'drag to select the area to keep'
     : tool === 'text'
-    ? textTool.selected
-      ? 'drag the text to position it — style it below'
-      : textTool.items.length > 0
-        ? 'tap text on the image to edit, or add another'
-        : 'tap + add text to place a caption'
+    ? textTool.editing
+      ? 'type your text — tap outside when finished'
+      : textTool.selected
+        ? 'drag to position — double-tap to edit the words'
+        : textTool.items.length > 0
+          ? 'tap text on the image to select it, or add another'
+          : 'tap + add text to place a caption'
     : busy
     ? 'erasing…'
     : detectResult === 'found'
@@ -797,9 +826,19 @@ export default function Editor({
               }}
             />
           )}
+          {/* inline text editor — type with a real caret in place; the
+              canvas skips this item while it's mounted. */}
+          {tool === 'text' && textTool.editing && dims && (
+            <TextEditOverlay
+              key={textTool.editing.id}
+              item={textTool.editing}
+              scale={displayScale}
+              onCommit={textTool.commitEditing}
+            />
+          )}
           {/* text selection ring — in the container's local space, so it
               tracks the item through zoom/pan like the canvases do. */}
-          {tool === 'text' && textTool.selected && dims && (() => {
+          {tool === 'text' && textTool.selected && !textTool.editing && dims && (() => {
             const b = measureTextItem(textTool.selected)
             return (
               <div
@@ -900,8 +939,10 @@ export default function Editor({
       ) : tool === 'text' ? (
         <TextControls
           selected={textTool.selected}
+          editing={textTool.editing !== null}
           onUpdate={textTool.updateSelected}
-          onAdd={textTool.addItem}
+          onAdd={addTextItem}
+          onEdit={() => textTool.selected && textTool.startEditing(textTool.selected.id)}
           onDelete={textTool.deleteSelected}
           onDone={exitText}
         />
