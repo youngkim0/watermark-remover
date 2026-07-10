@@ -16,11 +16,15 @@ export function useViewTransform({
   fit,
   enabled,
   onPinchStart,
+  baseCursor = 'none',
 }: {
   containerRef: React.RefObject<HTMLDivElement | null>
   fit: Dims
   enabled: boolean
   onPinchStart: () => void
+  /** Resting cursor over the container. The erase tool hides the OS cursor
+   *  ('none') behind its brush-circle preview; other tools need it visible. */
+  baseCursor?: string
 }) {
   const view = useRef<View>({ zoom: 1, panX: 0, panY: 0 })
   const [zoomPct, setZoomPct] = useState(100)
@@ -132,11 +136,11 @@ export function useViewTransform({
   // don't clobber the grab cursor mid-pan.
   useEffect(() => {
     const el = containerRef.current
-    if (el) el.style.cursor = 'none'
+    if (el) el.style.cursor = baseCursor
     const down = (e: KeyboardEvent) => {
       if (e.code !== 'Space' || !enabledRef.current) return
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
       e.preventDefault()
       spaceHeld.current = true
       if (el) el.style.cursor = 'grab'
@@ -145,7 +149,7 @@ export function useViewTransform({
       if (e.code !== 'Space') return
       spaceHeld.current = false
       panDrag.current = null
-      if (el) el.style.cursor = 'none'
+      if (el) el.style.cursor = baseCursor
     }
     window.addEventListener('keydown', down)
     window.addEventListener('keyup', up)
@@ -153,7 +157,7 @@ export function useViewTransform({
       window.removeEventListener('keydown', down)
       window.removeEventListener('keyup', up)
     }
-  }, [containerRef])
+  }, [containerRef, baseCursor])
 
   const onPointerDown = (e: React.PointerEvent): boolean => {
     if (!enabledRef.current) return false

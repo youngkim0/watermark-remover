@@ -72,6 +72,7 @@ export default function TextEditOverlay({
         outlineOffset: 4,
         caretColor: 'var(--amber)',
         background: 'transparent',
+        cursor: 'text',
       }}
     />
   )

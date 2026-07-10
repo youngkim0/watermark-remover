@@ -365,6 +365,9 @@ export default function Editor({
     fit,
     enabled: !cropping,
     onPinchStart: cancelStroke,
+    // Erase hides the OS cursor behind the brush-circle preview; every other
+    // tool needs a visible pointer over the image.
+    baseCursor: tool === 'erase' && !cropping ? 'none' : 'default',
   })
 
   // Reset zoom/pan to fit whenever a new image is loaded.
@@ -538,8 +541,10 @@ export default function Editor({
       if (painted === 0) return
       // Text items are an overlay, not image pixels — the inpaint above only
       // rebuilds what's beneath them. Brushing over your own text means
-      // "erase the text", so drop items the mask majority-covers.
-      const removedTexts = removeCoveredText(clusters)
+      // "erase the text", so drop items the strokes were aimed at. Per-stroke
+      // boxes, not clusters: a cluster's union bbox spans empty space between
+      // merged strokes and would inflate the overlap.
+      const removedTexts = removeCoveredText(boxes)
       track('erase', {
         count: eraseCount + 1,
         clusters: clusters.length,

@@ -167,21 +167,31 @@ export function useTextTool({
     [editingId]
   )
 
-  /** Remove items whose bbox is majority-covered by the erased regions
-   *  (users brush over their own text expecting the eraser to take it).
+  /** Remove items the erase strokes were aimed at (users brush over their
+   *  own text expecting the eraser to take it). A single thin swipe across
+   *  tall text covers little of the text's bbox area, so majority coverage
+   *  alone misses obvious intent — an item also goes when the strokes blanket
+   *  its central core (the centered 60%×40% band a deliberate swipe crosses,
+   *  which a graze along an edge doesn't reach).
    *  Returns the removed items so an undo can restore them. */
   const removeCovered = useCallback((rects: Rect[]) => {
+    const overlap = (b: { x: number; y: number; w: number; h: number }, r: Rect) => {
+      const ix = Math.min(b.x + b.w, r.x + r.w) - Math.max(b.x, r.x)
+      const iy = Math.min(b.y + b.h, r.y + r.h) - Math.max(b.y, r.y)
+      return ix > 0 && iy > 0 ? ix * iy : 0
+    }
     const removed: TextItem[] = []
     const kept: TextItem[] = []
     for (const it of itemsRef.current) {
       const b = measureTextItem(it)
+      const core = { x: b.x + b.w * 0.2, y: b.y + b.h * 0.3, w: b.w * 0.6, h: b.h * 0.4 }
       let cover = 0
+      let coreCover = 0
       for (const r of rects) {
-        const ix = Math.min(b.x + b.w, r.x + r.w) - Math.max(b.x, r.x)
-        const iy = Math.min(b.y + b.h, r.y + r.h) - Math.max(b.y, r.y)
-        if (ix > 0 && iy > 0) cover += ix * iy
+        cover += overlap(b, r)
+        coreCover += overlap(core, r)
       }
-      if (cover >= 0.5 * b.w * b.h) removed.push(it)
+      if (cover >= 0.5 * b.w * b.h || coreCover >= 0.5 * core.w * core.h) removed.push(it)
       else kept.push(it)
     }
     if (removed.length > 0) {
