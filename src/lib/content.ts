@@ -2,7 +2,7 @@ export const SITE_URL = 'https://unmark.live'
 export const SITE_NAME = 'Unmark'
 
 // Displayed in the footer. Bump together with package.json's "version".
-export const VERSION = 'v1.1.1'
+export const VERSION = 'v1.1.2'
 
 export const TAGLINE = 'Free AI watermark remover & magic eraser — in your browser'
 

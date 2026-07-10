@@ -504,15 +504,41 @@ export default function Editor({
     setBusy(true)
     setError(null)
     try {
-      // Work on crop windows around the mask, never the full frame:
+      const boxes0 = strokeRects(maskStrokes.current, dims)
+      if (boxes0.length === 0) return
+      const t0 = performance.now()
+
+      // Overlay text goes first: brushing over your own text means "erase the
+      // text", and since it was never part of the image, the photo beneath it
+      // must not be inpainted — that only smears untouched pixels. Strokes
+      // that served to delete a text item are dropped from the mask entirely.
+      const removedTexts = removeCoveredText(boxes0)
+      if (removedTexts.length > 0) {
+        const tboxes = removedTexts.map((t) => measureTextItem(t))
+        const margin = 12
+        const before = maskStrokes.current.length
+        maskStrokes.current = maskStrokes.current.filter((s) => {
+          if (s.kind === 'detect') return true
+          const [r] = strokeRects([s], dims)
+          if (!r) return false
+          let cover = 0
+          for (const b of tboxes) {
+            const ix = Math.min(r.x + r.w, b.x + b.w + margin) - Math.max(r.x, b.x - margin)
+            const iy = Math.min(r.y + r.h, b.y + b.h + margin) - Math.max(r.y, b.y - margin)
+            if (ix > 0 && iy > 0) cover += ix * iy
+          }
+          return cover < 0.7 * r.w * r.h
+        })
+        if (maskStrokes.current.length !== before) replayMask(dims)
+      }
+
+      // Work on crop windows around the remaining mask, never the full frame:
       // two full-res ImageData reads per erase (~100MB on a 12MP photo)
       // are enough churn to get mobile tabs killed. Distant marks run as
       // separate clusters so each keeps a tight, near-native-res window.
       const boxes = strokeRects(maskStrokes.current, dims)
-      if (boxes.length === 0) return
       const clusters = clusterRects(boxes, CLUSTER_GAP)
       const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
-      const t0 = performance.now()
       const patches: InpaintPatch[] = []
       let painted = 0
       for (const bbox of clusters) {
@@ -538,13 +564,7 @@ export default function Editor({
           imgCtx.putImageData(result.data, ax, ay)
         }
       }
-      if (painted === 0) return
-      // Text items are an overlay, not image pixels — the inpaint above only
-      // rebuilds what's beneath them. Brushing over your own text means
-      // "erase the text", so drop items the strokes were aimed at. Per-stroke
-      // boxes, not clusters: a cluster's union bbox spans empty space between
-      // merged strokes and would inflate the overlap.
-      const removedTexts = removeCoveredText(boxes)
+      if (painted === 0 && removedTexts.length === 0) return
       track('erase', {
         count: eraseCount + 1,
         clusters: clusters.length,
