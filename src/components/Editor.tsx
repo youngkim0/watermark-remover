@@ -20,7 +20,7 @@ import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
 import { useGlitterTool } from '@/lib/useGlitterTool'
-import { measureGlitterItem } from '@/lib/glitter'
+import { drawGlitterItems, measureGlitterItem } from '@/lib/glitter'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -732,14 +732,19 @@ export default function Editor({
   }
 
   const download = async () => {
-    track('download', { erases: eraseCount, texts: textTool.items.length })
+    track('download', {
+      erases: eraseCount,
+      texts: textTool.items.length,
+      glitters: glitterTool.items.length,
+    })
     const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
       b.toString(16).padStart(2, '0')
     ).join('')
     let source: HTMLCanvasElement = imgCanvasRef.current!
-    if (textTool.items.length > 0) {
-      // Composite the text overlay into the export (it never touches the
-      // working canvas, so text stays editable after saving).
+    if (textTool.items.length > 0 || glitterTool.items.length > 0) {
+      // Composite the overlays into the export (they never touch the working
+      // canvas, so they stay editable after saving). Sparkles draw last so
+      // they sit on top of a caption, matching the on-screen layering.
       await loadFontsFor(textTool.items)
       const scratch = document.createElement('canvas')
       scratch.width = source.width
@@ -747,6 +752,7 @@ export default function Editor({
       const ctx = scratch.getContext('2d')!
       ctx.drawImage(source, 0, 0)
       drawTextItems(ctx, textTool.items)
+      drawGlitterItems(ctx, glitterTool.items)
       source = scratch
     }
     source.toBlob((blob) => {
@@ -804,6 +810,7 @@ export default function Editor({
   const hasEdit =
     eraseCount > 0 ||
     textTool.items.length > 0 ||
+    glitterTool.items.length > 0 ||
     (dims !== null &&
       originalDims !== null &&
       (dims.w !== originalDims.w || dims.h !== originalDims.h))
