@@ -13,6 +13,7 @@ import { track } from '@/lib/analytics'
 import { detectMarks } from '@/lib/detect'
 import CropOverlay from './CropOverlay'
 import TextControls from './TextControls'
+import GlitterControls from './GlitterControls'
 import TextEditOverlay from './TextEditOverlay'
 import ZoomControls from './ZoomControls'
 import { useViewTransform } from '@/lib/useViewTransform'
@@ -1031,32 +1032,16 @@ export default function Editor({
           onDone={exitText}
         />
       ) : tool === 'glitter' ? (
-        <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
-          <button
-            type="button"
-            className="ctrl label px-3 h-9 sm:h-10 cursor-pointer"
-            onClick={glitterTool.undoLast}
-            disabled={glitterTool.items.length === 0}
-          >
-            undo
-          </button>
-          <button
-            type="button"
-            className="ctrl label px-3 h-9 sm:h-10 cursor-pointer"
-            onClick={glitterTool.deleteSelected}
-            disabled={!glitterTool.selected}
-          >
-            delete
-          </button>
-          <button
-            type="button"
-            onClick={exitGlitter}
-            className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer"
-            style={{ background: 'var(--amber)', color: '#181612', fontWeight: 500 }}
-          >
-            done
-          </button>
-        </div>
+        <GlitterControls
+          draft={glitterTool.draft}
+          selected={glitterTool.selected}
+          hasItems={glitterTool.items.length > 0}
+          maxSize={dims ? Math.max(400, Math.round(dims.w / 3)) : 400}
+          onDraftChange={glitterTool.setDraftValue}
+          onUndo={glitterTool.undoLast}
+          onDelete={glitterTool.deleteSelected}
+          onDone={exitGlitter}
+        />
       ) : (
         <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
           <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
