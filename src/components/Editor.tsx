@@ -20,7 +20,7 @@ import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
 import { useGlitterTool } from '@/lib/useGlitterTool'
-import { drawGlitterItems, measureGlitterItem } from '@/lib/glitter'
+import { drawGlitterItems, measureGlitterItem, type GlitterItem } from '@/lib/glitter'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -60,6 +60,7 @@ type CropUndo = {
   eraseHistory: EraseUndo[]
   eraseCountBefore: number
   textItems: TextItem[]
+  glitterItems: GlitterItem[]
 }
 
 /** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
@@ -492,9 +493,12 @@ export default function Editor({
       maskCanvasRef.current!.height = c.dims.h
       textCanvasRef.current!.width = c.dims.w
       textCanvasRef.current!.height = c.dims.h
+      glitterCanvasRef.current!.width = c.dims.w
+      glitterCanvasRef.current!.height = c.dims.h
       maskStrokes.current = []
       eraseHistory.current = c.eraseHistory
       textTool.restore(c.textItems)
+      glitterTool.restore(c.glitterItems)
       setMaskActions(0)
       setEraseCount(c.eraseCountBefore)
       setDims({ w: c.dims.w, h: c.dims.h })
@@ -693,6 +697,7 @@ export default function Editor({
         eraseHistory: eraseHistory.current.slice(),
         eraseCountBefore: eraseCount,
         textItems: textTool.items,
+        glitterItems: glitterTool.items,
       }
       setCropUndoAvailable(true)
     } else {
@@ -720,10 +725,13 @@ export default function Editor({
     maskCanvas.height = rect.h
     textCanvasRef.current!.width = rect.w
     textCanvasRef.current!.height = rect.h
+    glitterCanvasRef.current!.width = rect.w
+    glitterCanvasRef.current!.height = rect.h
 
     maskStrokes.current = []
     eraseHistory.current = []
     textTool.applyCrop(rect)
+    glitterTool.applyCrop(rect)
     setMaskActions(0)
     setEraseCount(0)
     setDims({ w: rect.w, h: rect.h })
