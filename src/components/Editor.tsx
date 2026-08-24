@@ -196,9 +196,13 @@ export default function Editor({
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
-  const { reset: resetText, removeCovered: removeCoveredText } = textTool
+  const { reset: resetText, removeCovered: removeCoveredText, addBack: addBackText } = textTool
   const glitterTool = useGlitterTool({ canvasRef: glitterCanvasRef, dims })
-  const { reset: resetGlitter, removeCovered: removeCoveredGlitter } = glitterTool
+  const {
+    reset: resetGlitter,
+    removeCovered: removeCoveredGlitter,
+    addBack: addBackGlitter,
+  } = glitterTool
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -549,6 +553,15 @@ export default function Editor({
     busyRef.current = true
     setBusy(true)
     setError(null)
+    // Hoisted so the catch block can undo whatever succeeded before a
+    // mid-erase failure (e.g. mobile OOM inside inpaint()): these are the
+    // same pieces a successful run would have bundled into an undo entry.
+    const patches: InpaintPatch[] = []
+    let removedTexts: TextItem[] = []
+    let removedGlitters: GlitterItem[] = []
+    // Once the undo entry is pushed, the work is the history's to reverse —
+    // the catch below must not also roll it back.
+    let committed = false
     try {
       const boxes0 = strokeRects(maskStrokes.current, dims)
       if (boxes0.length === 0) return
@@ -558,8 +571,8 @@ export default function Editor({
       // "erase that", and since neither was ever part of the image, the photo
       // beneath must not be inpainted — that only smears untouched pixels.
       // Strokes that served to delete an overlay item are dropped entirely.
-      const removedTexts = removeCoveredText(boxes0)
-      const removedGlitters = removeCoveredGlitter(boxes0)
+      removedTexts = removeCoveredText(boxes0)
+      removedGlitters = removeCoveredGlitter(boxes0)
       if (removedTexts.length > 0 || removedGlitters.length > 0) {
         const overlayBoxes = [
           ...removedTexts.map((t) => measureTextItem(t)),
@@ -577,7 +590,6 @@ export default function Editor({
       const boxes = strokeRects(maskStrokes.current, dims)
       const clusters = clusterRects(boxes, CLUSTER_GAP)
       const imgCtx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
-      const patches: InpaintPatch[] = []
       let painted = 0
       for (const bbox of clusters) {
         const crop = computeCrop(bbox, dims.w, dims.h)
@@ -613,6 +625,7 @@ export default function Editor({
       setModel({ state: 'ready' })
       if (patches.length > 0 || removedTexts.length > 0 || removedGlitters.length > 0) {
         eraseHistory.current.push({ patches, texts: removedTexts, glitters: removedGlitters })
+        committed = true
         let bytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
         while (
           eraseHistory.current.length > MAX_UNDO ||
@@ -627,6 +640,26 @@ export default function Editor({
       setDetectResult(null)
       setEraseCount((n) => n + 1)
     } catch (err) {
+      // Undo whatever this attempt already applied before it threw: the
+      // overlay items were removed from hook state and the patches were
+      // painted onto the canvas up top, and neither made it into
+      // eraseHistory, so nothing else will ever put them back. This does
+      // NOT replay the mask — the strokes that were dropped to make room
+      // for the overlay-item removal are mutated in place and out of scope
+      // to reconstruct; only the pixels and the overlay items are restored.
+      // Skipped once `committed` is true: from that point the work is in
+      // eraseHistory and `undo` owns reversing it, so rolling back here too
+      // would double-restore.
+      if (!committed) {
+        if (patches.length > 0) {
+          const ctx = imgCanvasRef.current!.getContext('2d')!
+          for (let i = patches.length - 1; i >= 0; i--) {
+            ctx.putImageData(patches[i].data, patches[i].x, patches[i].y)
+          }
+        }
+        addBackText(removedTexts)
+        addBackGlitter(removedGlitters)
+      }
       console.error(err)
       setError('Inpainting failed — try a smaller image or reload.')
       track('erase-error')
@@ -634,7 +667,15 @@ export default function Editor({
       busyRef.current = false
       setBusy(false)
     }
-  }, [dims, eraseCount, onModelProgress, removeCoveredText, removeCoveredGlitter])
+  }, [
+    dims,
+    eraseCount,
+    onModelProgress,
+    removeCoveredText,
+    removeCoveredGlitter,
+    addBackText,
+    addBackGlitter,
+  ])
 
   const erase = useCallback(() => {
     if (maskActions === 0) return

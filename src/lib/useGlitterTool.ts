@@ -98,8 +98,13 @@ export function useGlitterTool({
           p.x >= b.x - HIT_PAD && p.x <= b.x + b.w + HIT_PAD &&
           p.y >= b.y - HIT_PAD && p.y <= b.y + b.h + HIT_PAD
         ) {
-          setSelectedId(items[i].id)
-          dragRef.current = { id: items[i].id, dx: items[i].x - p.x, dy: items[i].y - p.y }
+          const hit = items[i]
+          setSelectedId(hit.id)
+          // The toolbar always displays the selected sparkle's style, so the
+          // draft must adopt it here — otherwise the next tap (which places
+          // from the draft) can silently disagree with what's on screen.
+          setDraft((d) => ({ ...d, shape: hit.shape, color: hit.color, size: hit.size }))
+          dragRef.current = { id: hit.id, dx: hit.x - p.x, dy: hit.y - p.y }
           e.currentTarget.setPointerCapture(e.pointerId)
           return true
         }
