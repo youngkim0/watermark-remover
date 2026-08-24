@@ -188,6 +188,23 @@ function polygonStar(ctx: CanvasRenderingContext2D, points: number, inner: numbe
   ctx.fill()
 }
 
+/** Crossed tapered spikes — a needle star. Unlike `pinchedStar`, whose waist
+ *  is dominated by its endpoints, each spike is its own slim shape, so the
+ *  star stays fine however many spikes it has. */
+function needleStar(ctx: CanvasRenderingContext2D, spikes: number, halfWidth: number) {
+  for (let i = 0; i < spikes; i++) {
+    ctx.save()
+    ctx.rotate((i / spikes) * Math.PI)
+    ctx.beginPath()
+    ctx.moveTo(0, -1)
+    ctx.quadraticCurveTo(halfWidth, 0, 0, 1)
+    ctx.quadraticCurveTo(-halfWidth, 0, 0, -1)
+    ctx.closePath()
+    ctx.fill()
+    ctx.restore()
+  }
+}
+
 type Draw = (ctx: CanvasRenderingContext2D, item: GlitterItem) => void
 
 const SHAPES: Record<GlitterShape, Draw> = {
@@ -209,7 +226,7 @@ const SHAPES: Record<GlitterShape, Draw> = {
   twinkle: (ctx, item) => {
     halo(ctx, item.color, 0.28)
     ctx.fillStyle = item.color
-    pinchedStar(ctx, [1, 1, 1, 1, 1, 1], 0.03)
+    needleStar(ctx, 3, 0.18)
   },
 
   // 4. Lens-flare cross: long vertical rays, short horizontal, bright core.

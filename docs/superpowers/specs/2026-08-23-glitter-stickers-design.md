@@ -108,7 +108,7 @@ scaled so the shape is authored once in a unit circle of radius 1.
 |---|---|---|---|
 | 1 | `spark` | ✦ classic 4-point sparkle | 4 tips joined by quadratic curves pinched toward the center |
 | 2 | `star` | ★ 5-point star | 10 alternating radii, straight edges |
-| 3 | `twinkle` | ✳ fine 6-point needle star | six tips pinched to a near-zero waist |
+| 3 | `twinkle` | ✳ fine 6-point needle star | 3 crossed tapered spikes, each its own slim shape |
 | 4 | `burst` | lens-flare cross | 2 long + 2 short tapered rays over a bright gradient core |
 | 5 | `dust` | scattered glitter specks | seeded scatter of ~9 dots + 2 mini sparks |
 | 6 | `bokeh` | soft out-of-focus light orb | one radial gradient, brightest just inside the rim, fading to nothing at the edge |
