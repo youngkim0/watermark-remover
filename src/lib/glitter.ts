@@ -21,18 +21,18 @@ export type GlitterShape =
   | 'burst'
   | 'dust'
   | 'bokeh'
-  | 'ring'
   | 'diamond'
   | 'heart'
   | 'snowflake'
-  | 'flare'
   | 'prism'
   | 'halo'
-  | 'shimmer'
-  | 'comet'
-  | 'glint'
+  | 'sparkles'
+  | 'foil'
+  | 'sequin'
+  | 'blossom'
+  | 'gem'
+  | 'confetti'
   | 'grain'
-  | 'lensflare'
   | 'bokehPlate'
 
 export type GlitterItem = {
@@ -50,23 +50,23 @@ export type GlitterItem = {
  *  first, then objects, then the wide/atmospheric ones. */
 export const GLITTER_SHAPES: GlitterShape[] = [
   'spark',
-  'glint',
+  'sparkles',
   'burst',
   'twinkle',
-  'star',
   'prism',
+  'star',
+  'gem',
+  'sequin',
+  'blossom',
+  'heart',
+  'diamond',
+  'snowflake',
   'dust',
-  'shimmer',
-  'comet',
-  'flare',
+  'foil',
+  'confetti',
   'bokeh',
   'halo',
-  'ring',
-  'diamond',
-  'heart',
-  'snowflake',
   'grain',
-  'lensflare',
   'bokehPlate',
 ]
 
@@ -85,17 +85,17 @@ const ROTATION_JITTER: Record<GlitterShape, number> = {
   burst: Math.PI,
   dust: Math.PI,
   bokeh: Math.PI,
-  ring: Math.PI,
   snowflake: Math.PI,
   prism: Math.PI,
   halo: Math.PI,
-  shimmer: Math.PI,
-  comet: Math.PI,
-  glint: Math.PI,
+  sparkles: Math.PI,
+  foil: Math.PI,
+  sequin: Math.PI,
+  blossom: Math.PI,
+  gem: Math.PI,
+  confetti: Math.PI,
   grain: Math.PI,
   bokehPlate: Math.PI,
-  lensflare: 0.22, // as with `flare` — a streak only reads as a lens artifact near level
-  flare: 0.22, // ~12° — an anamorphic streak reads as a lens artifact only near level
   diamond: 0.26, // ~15° — 2-fold symmetry, so a full turn tips it over
   heart: 0.17, // ~10° — a slight tilt is charming, sideways is broken
 }
@@ -161,7 +161,6 @@ export function drawGlitterItems(ctx: CanvasRenderingContext2D, items: GlitterIt
 /** Which photographic plates a set of items needs. */
 const PLATE_OF: Partial<Record<GlitterShape, PlateId>> = {
   grain: 'grain',
-  lensflare: 'lensflare',
   bokehPlate: 'bokehPlate',
 }
 

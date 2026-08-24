@@ -7,13 +7,13 @@
 // with 'lighter', and black adds nothing. No alpha channel is needed, so they
 // ship as JPEGs — a PNG of fine speckle is five times the size.
 
-export type PlateId = 'grain' | 'lensflare' | 'bokehPlate'
+export type PlateId = 'grain' | 'bokehPlate'
 
 type PlateSpec = {
   src: string
   /** Height as a fraction of width, for the plates that aren't square. */
   aspect: number
-  /** Feather the edges into a circle. Off for the flare, which is a strip. */
+  /** Feather the edges into a circle. */
   vignette: boolean
   /** How strongly the item's colour tints the plate. Bokeh keeps most of its
    *  own hues — that multi-coloured spill is the whole point of it. */
@@ -22,7 +22,6 @@ type PlateSpec = {
 
 const PLATES: Record<PlateId, PlateSpec> = {
   grain: { src: '/glitter/grain.jpg', aspect: 1, vignette: true, tint: 1 },
-  lensflare: { src: '/glitter/flare.jpg', aspect: 210 / 768, vignette: false, tint: 0.85 },
   bokehPlate: { src: '/glitter/bokeh.jpg', aspect: 1, vignette: true, tint: 0.35 },
 }
 

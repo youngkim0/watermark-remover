@@ -2,9 +2,9 @@
 
 Date: 2026-08-23; rendering rebuilt 2026-08-24
 Status: shipped. The first version shipped on 2026-08-23 and read as flat
-stickers; the 2026-08-24 rebuild redraws every shape as light, adds six more
-procedural shapes and three photographic plates, and is recorded inline below
-rather than as a separate document.
+stickers; the 2026-08-24 rebuild redraws every shape as light, adds shapes built from
+filled area rather than hairlines, and two photographic plates. Recorded
+inline below rather than as a separate document.
 
 ## Problem
 
@@ -146,35 +146,57 @@ is a saturated gold for the same reason.
 
 ### Roster
 
-Sixteen procedural, three photographic. Palette order runs points of light
-first, then objects, then the wide and atmospheric ones.
+Seventeen procedural, two photographic. Palette order runs points of light
+first, then objects, then scatters, then the atmospheric ones.
 
 | id | Reads as |
 |---|---|
-| `spark` | four long chromatic spikes + four short diagonals |
-| `glint` | fine star-filter cross on a hard little light |
+| `spark` | four fat chromatic rays + four short diagonals, with companions |
+| `sparkles` | ✨ one big four-point sparkle with two smaller ones |
 | `burst` | cinematic lens star: long vertical, short horizontal |
-| `twinkle` | six fine needles of uneven length |
+| `twinkle` | six needles of uneven length |
+| `prism` | refraction — rays split into spectral colours |
 | `star` | ★ five-point star, shaded as a luminous body |
-| `prism` | refraction — spikes split into spectral colours |
+| `gem` | cut stone: an octagon whose facets catch the light unevenly |
+| `sequin` | filled disc with a bright rim and one soft specular highlight |
+| `blossom` | five petals of light |
+| `heart` | glossy heart |
+| `diamond` | gem with a refraction spike |
+| `snowflake` | ❄ six-arm crystal with a tinted glow along the arms |
 | `dust` | glitter powder: 26 grains, each with its own bloom |
-| `shimmer` | a field of fine crossed glints |
-| `comet` | bright head with a tapering dust trail |
-| `flare` | anamorphic streak with a hot core |
+| `foil` | metallic flakes — what is actually in a jar of glitter |
+| `confetti` | small curled ribbons in shifting hues |
 | `bokeh` | defocused hexagonal aperture, hollow, bright rim |
 | `halo` | pure glow, no geometry |
-| `ring` | luminous ring with a glint where it catches the light |
-| `diamond` | gem with a refraction spike |
-| `heart` | glossy heart |
-| `snowflake` | ❄ six-arm crystal with a tinted glow along the arms |
 | `grain` | **plate** — photographed glitter powder |
-| `lensflare` | **plate** — photographed anamorphic flare |
 | `bokehPlate` | **plate** — photographed defocused bokeh, keeps its own colours |
+
+### Area beats brightness (2026-08-24, second pass)
+
+The first rebuild kept six shapes built from hairlines — `lensflare`, `flare`,
+`glint`, `ring`, `shimmer`, `comet`. They were invisible in use, and measuring
+them proved why rather than leaving it to taste: each shape was rendered over
+a light and a dark field and scored by mean per-pixel change. The line shapes
+scored 2.9–14; the filled ones scored 31–86. `lensflare` scored **1.7** on a
+light field, the worst in the set by a wide margin.
+
+A hairline covers almost no area, so however bright it is there is not enough
+of it to register against a photograph. All six were cut — the flare plate
+with them — and replaced by six shapes built from filled area: `sparkles`,
+`gem`, `sequin`, `blossom`, `foil`, `confetti`, which measure 34–86. The
+survivors that were still thin (`spark`, `twinkle`, `prism`, `burst`) had
+their rays roughly doubled in width, which lifted each of them clear of the
+band that was cut.
+
+**Measure visibility, don't judge it.** A shape that looks fine at 400px in
+isolation can be invisible at 100px over a photograph, and the difference is
+not a matter of opinion.
 
 ### The photographic plates
 
-Three plates generated with Higgsfield and shipped in `public/glitter/`
-(~207KB total). Procedural shapes can imitate the geometry of light but not
+Two plates generated with Higgsfield and shipped in `public/glitter/`
+(~197KB total; a third, an anamorphic flare, was generated and then cut with
+the other line shapes). Procedural shapes can imitate the geometry of light but not
 its texture; these carry grain a canvas path cannot.
 
 They are lit subjects on pure black, so `glitterPlates.ts` converts luminance
