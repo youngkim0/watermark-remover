@@ -121,8 +121,12 @@ Every shape paints a soft radial halo first — `color` at ~0.35 alpha fading to
 transparent at `size/2` — then the mark itself at full alpha. That is what
 makes a flat fill read as light rather than as a pasted icon.
 
-Rotation is randomized over a full turn at placement so a cluster never looks
-stamped; the symmetric shapes absorb that range without looking wrong.
+Rotation is randomized at placement so a cluster never looks stamped, but
+bounded per shape. The eight symmetric shapes take a full turn — a 5-point
+star's full turn is visually only ±36°, a 6-arm snowflake's ±30°, and dust,
+bokeh and ring look identical at any angle. `heart` (no rotational symmetry)
+and `diamond` (2-fold) have a canonical "up", so they get a small tilt
+instead; a heart at a random angle lands upside down.
 
 Adding, removing or swapping a shape is one function plus one union member and
 nothing else. Likely alternates if any of the ten underperform: `confetti`
