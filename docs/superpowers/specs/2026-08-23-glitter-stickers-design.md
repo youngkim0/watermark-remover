@@ -161,6 +161,12 @@ selected sparkle *and* update the draft; with nothing selected they update the
 draft only. The next tap uses the draft. Setting gold-medium once and tapping
 ten times is ten taps.
 
+Selecting an existing sparkle also adopts its style into the draft. The
+toolbar always displays the selected sparkle's style, so without that the two
+drift apart: select a small heart, and the palette would read "heart" while
+the next tap still placed the large star the draft was holding. The rule that
+keeps it honest is that the toolbar and the next tap must never disagree.
+
 Initial draft: `shape: 'spark'`, `color: '#ffffff'`,
 `size: clamp(round(dims.w / 10), 24, 400)`.
 
@@ -212,6 +218,14 @@ useful on a 4K photo without making the slider useless on a small one.
   crop-undo snapshot carries `glitterItems` beside `textItems`, restored on
   undo. The glitter canvas is resized with the others in both `applyCrop` and
   the crop-undo branch.
+- **A failed erase.** `runErase` deletes covered overlay items and drops their
+  strokes *before* the model runs, but only records the undo entry *after*.
+  If the model throws in between — mobile OOM is a live failure mode here —
+  those sparkles and captions would be gone with nothing to restore them. So
+  the catch path rolls back what the attempt had already applied: the patches
+  it painted, in reverse, and the overlay items it removed. A `committed`
+  flag, set when the undo entry is pushed, marks the point where ownership of
+  the reversal passes to `undo`, so the two can never both fire.
 - **Brushing over a sparkle.** Same contract as text (commit `d7b59d8`): a
   sparkle the user brushed over is deleted, and the strokes that deleted it
   are dropped from the mask so **the photo underneath is not inpainted** —

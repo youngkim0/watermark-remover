@@ -1591,6 +1591,25 @@ git commit -m "Erase removes brushed-over sparkles without inpainting beneath"
 
 ---
 
+## Post-review amendments
+
+Two defects surfaced only in the final whole-branch review, because each came
+from the composition of separately-correct tasks. Both were fixed in `8723d02`:
+
+1. **The palette stopped predicting what a tap places.** Task 3's toolbar
+   displays `selected ?? draft`; Task 2's placement reads `draft`; selecting an
+   existing sparkle never adopted its style into the draft, so after selecting
+   an older sparkle the palette showed one shape while the next tap placed
+   another. Fixed in `useGlitterTool.onPointerDown`'s hit branch, which now
+   adopts the hit item's shape, colour and size into the draft.
+2. **A failed erase destroyed overlay items with no undo.** `runErase` removes
+   covered items and drops their strokes before `await inpaint(...)`, but
+   pushes the undo entry after it. `patches`, `removedTexts` and
+   `removedGlitters` are now hoisted above the `try`, and the `catch` rolls
+   them back — patches in reverse, then `addBack` on both hooks — guarded by a
+   `committed` flag set when the undo entry is pushed, so the rollback and
+   `undo` can never both reverse the same work.
+
 ## Done criteria
 
 All six tasks committed, and on a final pass through a fresh `npm run dev`:
