@@ -46,9 +46,10 @@ type MaskStroke =
   | { kind: 'detect'; rects: Rect[] }
 
 // One entry per erase action; an action may inpaint several clusters (each
-// contributing a patch) and swallow text items brushed over. Undo restores
-// the whole entry: patches in reverse order, then the removed text.
-type EraseUndo = { patches: InpaintPatch[]; texts: TextItem[] }
+// contributing a patch) and swallow text or sparkles brushed over. Undo
+// restores the whole entry: patches in reverse order, then the removed
+// overlay items.
+type EraseUndo = { patches: InpaintPatch[]; texts: TextItem[]; glitters: GlitterItem[] }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // erase-undo stack that was valid against them. Kept only when it fits under
@@ -89,6 +90,30 @@ function strokeRects(strokes: MaskStroke[], d: Dims): Rect[] {
     }
   }
   return out
+}
+
+/** Drop the mask strokes that served to delete an overlay item, so the erase
+ *  doesn't also inpaint the photo underneath it (that only smears untouched
+ *  pixels — the item was never part of the image). A stroke goes when most of
+ *  it lies over the removed items' footprints. */
+function dropOverlayStrokes(
+  strokes: MaskStroke[],
+  boxes: { x: number; y: number; w: number; h: number }[],
+  d: Dims
+): MaskStroke[] {
+  const margin = 12
+  return strokes.filter((s) => {
+    if (s.kind === 'detect') return true
+    const [r] = strokeRects([s], d)
+    if (!r) return false
+    let cover = 0
+    for (const b of boxes) {
+      const ix = Math.min(r.x + r.w, b.x + b.w + margin) - Math.max(r.x, b.x - margin)
+      const iy = Math.min(r.y + r.h, b.y + b.h + margin) - Math.max(r.y, b.y - margin)
+      if (ix > 0 && iy > 0) cover += ix * iy
+    }
+    return cover < 0.7 * r.w * r.h
+  })
 }
 
 // Marks farther apart than this run as separate inpaints. The model works at
@@ -173,7 +198,7 @@ export default function Editor({
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
   const { reset: resetText, removeCovered: removeCoveredText } = textTool
   const glitterTool = useGlitterTool({ canvasRef: glitterCanvasRef, dims })
-  const { reset: resetGlitter } = glitterTool
+  const { reset: resetGlitter, removeCovered: removeCoveredGlitter } = glitterTool
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -475,6 +500,7 @@ export default function Editor({
         ctx.putImageData(prev.patches[i].data, prev.patches[i].x, prev.patches[i].y)
       }
       textTool.addBack(prev.texts)
+      glitterTool.addBack(prev.glitters)
       setEraseCount((n) => Math.max(0, n - 1))
       track('undo')
       return
@@ -528,27 +554,19 @@ export default function Editor({
       if (boxes0.length === 0) return
       const t0 = performance.now()
 
-      // Overlay text goes first: brushing over your own text means "erase the
-      // text", and since it was never part of the image, the photo beneath it
-      // must not be inpainted — that only smears untouched pixels. Strokes
-      // that served to delete a text item are dropped from the mask entirely.
+      // Overlay items go first: brushing over your own text or sparkle means
+      // "erase that", and since neither was ever part of the image, the photo
+      // beneath must not be inpainted — that only smears untouched pixels.
+      // Strokes that served to delete an overlay item are dropped entirely.
       const removedTexts = removeCoveredText(boxes0)
-      if (removedTexts.length > 0) {
-        const tboxes = removedTexts.map((t) => measureTextItem(t))
-        const margin = 12
+      const removedGlitters = removeCoveredGlitter(boxes0)
+      if (removedTexts.length > 0 || removedGlitters.length > 0) {
+        const overlayBoxes = [
+          ...removedTexts.map((t) => measureTextItem(t)),
+          ...removedGlitters.map((g) => measureGlitterItem(g)),
+        ]
         const before = maskStrokes.current.length
-        maskStrokes.current = maskStrokes.current.filter((s) => {
-          if (s.kind === 'detect') return true
-          const [r] = strokeRects([s], dims)
-          if (!r) return false
-          let cover = 0
-          for (const b of tboxes) {
-            const ix = Math.min(r.x + r.w, b.x + b.w + margin) - Math.max(r.x, b.x - margin)
-            const iy = Math.min(r.y + r.h, b.y + b.h + margin) - Math.max(r.y, b.y - margin)
-            if (ix > 0 && iy > 0) cover += ix * iy
-          }
-          return cover < 0.7 * r.w * r.h
-        })
+        maskStrokes.current = dropOverlayStrokes(maskStrokes.current, overlayBoxes, dims)
         if (maskStrokes.current.length !== before) replayMask(dims)
       }
 
@@ -584,16 +602,17 @@ export default function Editor({
           imgCtx.putImageData(result.data, ax, ay)
         }
       }
-      if (painted === 0 && removedTexts.length === 0) return
+      if (painted === 0 && removedTexts.length === 0 && removedGlitters.length === 0) return
       track('erase', {
         count: eraseCount + 1,
         clusters: clusters.length,
         texts: removedTexts.length,
+        glitters: removedGlitters.length,
         ms: Math.round(performance.now() - t0),
       })
       setModel({ state: 'ready' })
-      if (patches.length > 0 || removedTexts.length > 0) {
-        eraseHistory.current.push({ patches, texts: removedTexts })
+      if (patches.length > 0 || removedTexts.length > 0 || removedGlitters.length > 0) {
+        eraseHistory.current.push({ patches, texts: removedTexts, glitters: removedGlitters })
         let bytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
         while (
           eraseHistory.current.length > MAX_UNDO ||
@@ -615,7 +634,7 @@ export default function Editor({
       busyRef.current = false
       setBusy(false)
     }
-  }, [dims, eraseCount, onModelProgress, removeCoveredText])
+  }, [dims, eraseCount, onModelProgress, removeCoveredText, removeCoveredGlitter])
 
   const erase = useCallback(() => {
     if (maskActions === 0) return
