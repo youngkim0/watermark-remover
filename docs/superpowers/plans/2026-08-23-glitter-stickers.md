@@ -209,7 +209,7 @@ const SHAPES: Record<GlitterShape, Draw> = {
   twinkle: (ctx, item) => {
     halo(ctx, item.color, 0.28)
     ctx.fillStyle = item.color
-    pinchedStar(ctx, [1, 1, 1, 1, 1, 1], 0.09)
+    pinchedStar(ctx, [1, 1, 1, 1, 1, 1], 0.03)
   },
 
   // 4. Lens-flare cross: long vertical rays, short horizontal, bright core.
@@ -252,17 +252,19 @@ const SHAPES: Record<GlitterShape, Draw> = {
     }
   },
 
-  // 6. Soft out-of-focus light orb.
+  // 6. Soft out-of-focus light orb. One gradient brightening toward the rim
+  // and fading to nothing at the edge — a flat disc plus a stroked rim reads
+  // as an opaque coin, not as light.
   bokeh: (ctx, item) => {
-    ctx.fillStyle = withAlpha(item.color, 0.26)
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1)
+    g.addColorStop(0, withAlpha(item.color, 0.16))
+    g.addColorStop(0.82, withAlpha(item.color, 0.28))
+    g.addColorStop(0.92, withAlpha(item.color, 0.5))
+    g.addColorStop(1, withAlpha(item.color, 0))
+    ctx.fillStyle = g
     ctx.beginPath()
-    ctx.arc(0, 0, 0.95, 0, TAU)
+    ctx.arc(0, 0, 1, 0, TAU)
     ctx.fill()
-    ctx.strokeStyle = withAlpha(item.color, 0.6)
-    ctx.lineWidth = 0.12
-    ctx.beginPath()
-    ctx.arc(0, 0, 0.88, 0, TAU)
-    ctx.stroke()
   },
 
   // 7. Thin halo ring, alpha falling off around the sweep.
@@ -435,7 +437,7 @@ Expected: ten labelled marks on a blue-grey field. Check each one:
 - `twinkle` — six thin needles.
 - `burst` — a cross with long vertical rays, short horizontal, white-hot center.
 - `dust` — a loose scatter of small dots plus two tiny sparkles, all inside the footprint.
-- `bokeh` — a soft translucent disc with a brighter rim.
+- `bokeh` — a soft orb of light, brightest just inside the rim, edge fading to nothing (no hard outline).
 - `ring` — a thin circle, bright on one side, faint on the other.
 - `diamond` — a gem with a lighter top-right facet.
 - `heart` — a heart with a small highlight, fully inside the footprint.
