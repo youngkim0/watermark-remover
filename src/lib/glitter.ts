@@ -312,10 +312,27 @@ export function measureGlitterItem(item: GlitterItem): {
   return { x: item.x - item.size / 2, y: item.y - item.size / 2, w: item.size, h: item.size }
 }
 
-/** Placement-time randomness. A full turn: the symmetric shapes absorb it,
- *  and a cluster of sparkles never looks stamped. */
-export function randomRotation(): number {
-  return Math.random() * TAU
+/** How far a shape may rotate at placement. A shape with a canonical "up"
+ *  gets a small tilt; the rest take a full turn so a cluster never looks
+ *  stamped. The symmetric shapes cost nothing to rotate freely — a 5-point
+ *  star's full turn is visually ±36°, a 6-arm snowflake's ±30°, and dust,
+ *  bokeh and ring look identical at any angle. A heart does not: it has no
+ *  rotational symmetry, so a full turn lands it upside down. */
+const ROTATION_JITTER: Record<GlitterShape, number> = {
+  spark: Math.PI,
+  star: Math.PI,
+  twinkle: Math.PI,
+  burst: Math.PI,
+  dust: Math.PI,
+  bokeh: Math.PI,
+  ring: Math.PI,
+  snowflake: Math.PI,
+  diamond: 0.26, // ~15° — 2-fold symmetry, so a full turn tips it over
+  heart: 0.17, // ~10° — a slight tilt is charming, sideways is broken
+}
+
+export function randomRotation(shape: GlitterShape): number {
+  return (Math.random() * 2 - 1) * ROTATION_JITTER[shape]
 }
 
 export function randomSeed(): number {

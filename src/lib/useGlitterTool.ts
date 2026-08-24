@@ -111,7 +111,7 @@ export function useGlitterTool({
         y: p.y,
         size: draft.size || defaultSize(dims),
         color: draft.color,
-        rotation: randomRotation(),
+        rotation: randomRotation(draft.shape),
         seed: randomSeed(),
       }
       setItems((list) => [...list, item])
