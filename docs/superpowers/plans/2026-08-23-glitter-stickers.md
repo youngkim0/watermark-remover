@@ -560,10 +560,14 @@ export function useGlitterTool({
     itemsRef.current = items
   }, [items])
 
-  useEffect(() => {
-    if (!dims) return
-    setDraft((d) => (d.size === 0 ? { ...d, size: defaultSize(dims) } : d))
-  }, [dims])
+  // Derive the default size once dims arrive, then leave the user's choice
+  // alone. Adjusted during render (guarded by size === 0, so it settles after
+  // one extra render) rather than in an effect — this is state derived from a
+  // prop, not a side effect to synchronize, and this repo's
+  // react-hooks/set-state-in-effect rule rejects the effect form outright.
+  if (dims && draft.size === 0) {
+    setDraft((d) => ({ ...d, size: defaultSize(dims) }))
+  }
 
   // Redraw the overlay whenever items change. Cheap: a few dozen paths.
   useEffect(() => {
