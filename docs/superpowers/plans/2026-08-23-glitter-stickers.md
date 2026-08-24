@@ -1470,12 +1470,12 @@ Replace the text-removal block in `runErase` (`src/components/Editor.tsx:511-532
       const removedTexts = removeCoveredText(boxes0)
       const removedGlitters = removeCoveredGlitter(boxes0)
       if (removedTexts.length > 0 || removedGlitters.length > 0) {
-        const boxes = [
+        const overlayBoxes = [
           ...removedTexts.map((t) => measureTextItem(t)),
           ...removedGlitters.map((g) => measureGlitterItem(g)),
         ]
         const before = maskStrokes.current.length
-        maskStrokes.current = dropOverlayStrokes(maskStrokes.current, boxes, dims)
+        maskStrokes.current = dropOverlayStrokes(maskStrokes.current, overlayBoxes, dims)
         if (maskStrokes.current.length !== before) replayMask(dims)
       }
 ```
