@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import {
   drawGlitterItems,
+  loadPlatesFor,
   measureGlitterItem,
   randomRotation,
   randomSeed,
@@ -46,7 +47,10 @@ export function useGlitterTool({
   // first image's dimensions and then leaves the user's choice alone.
   const [draft, setDraft] = useState<GlitterDraft>({
     shape: 'spark',
-    color: '#ffffff',
+    // A saturated gold rather than white: white light on a bright photo has
+    // no contrast to work with, and a screen cannot draw brighter than white.
+    // Gold reads on a pale sky and still looks like light on a dark frame.
+    color: '#ffc65a',
     size: 0,
   })
   const dragRef = useRef<{ id: number; dx: number; dy: number } | null>(null)
@@ -65,13 +69,27 @@ export function useGlitterTool({
     setDraft((d) => ({ ...d, size: defaultSize(dims) }))
   }
 
-  // Redraw the overlay whenever items change. Cheap: a few dozen paths.
+  // Redraw the overlay whenever items change, then again once any
+  // photographic plates finish loading — a plate shape draws nothing until
+  // its image is in memory, the same way a text item draws in a fallback
+  // face until its font lands.
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !dims) return
     const ctx = canvas.getContext('2d')!
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    drawGlitterItems(ctx, items)
+    const draw = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      drawGlitterItems(ctx, items)
+    }
+    draw()
+    if (items.length === 0) return
+    let alive = true
+    loadPlatesFor(items).then(() => {
+      if (alive) draw()
+    })
+    return () => {
+      alive = false
+    }
   }, [items, dims, canvasRef])
 
   const toNatural = useCallback(

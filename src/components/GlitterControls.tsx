@@ -1,13 +1,23 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
-import { GLITTER_SHAPES, drawGlitterItems, type GlitterItem, type GlitterShape } from '@/lib/glitter'
+import {
+  GLITTER_SHAPES,
+  drawGlitterItems,
+  loadPlatesFor,
+  type GlitterItem,
+  type GlitterShape,
+} from '@/lib/glitter'
 import type { GlitterDraft } from '@/lib/useGlitterTool'
 
 // Glitter-appropriate palette. Deliberately its own list rather than a
 // constant shared with TextControls — caption colors and sparkle colors are
 // not the same design problem.
-const SWATCHES = ['#ffffff', '#e8a33d', '#f2a7c3', '#9fd0e8', '#181612']
+// Glitter-appropriate palette, deliberately its own list rather than a
+// constant shared with TextControls — caption colours and sparkle colours are
+// not the same design problem. No black: a sparkle is screened onto the photo,
+// and adding light cannot darken it.
+const SWATCHES = ['#fff6e0', '#ffc65a', '#e8a33d', '#f2a7c3', '#9fd0e8', '#c9a7ff']
 
 const ICON = 30
 
@@ -30,11 +40,23 @@ function ShapeIcon({ shape }: { shape: GlitterShape }) {
       x: ICON / 2,
       y: ICON / 2,
       size: ICON - 6,
-      color: '#ece8df',
+      color: '#ffe9c4',
       rotation: 0,
       seed: 7,
     }
-    drawGlitterItems(ctx, [item])
+    const draw = () => {
+      ctx.clearRect(0, 0, ICON, ICON)
+      drawGlitterItems(ctx, [item])
+    }
+    draw()
+    // The photographic shapes have nothing to draw until their plate loads.
+    let alive = true
+    loadPlatesFor([item]).then(() => {
+      if (alive) draw()
+    })
+    return () => {
+      alive = false
+    }
   }, [shape])
   return <canvas ref={ref} style={{ width: ICON, height: ICON }} aria-hidden />
 }

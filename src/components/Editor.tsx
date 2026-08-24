@@ -20,7 +20,12 @@ import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
 import { useGlitterTool } from '@/lib/useGlitterTool'
-import { drawGlitterItems, measureGlitterItem, type GlitterItem } from '@/lib/glitter'
+import {
+  drawGlitterItems,
+  loadPlatesFor,
+  measureGlitterItem,
+  type GlitterItem,
+} from '@/lib/glitter'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -814,6 +819,7 @@ export default function Editor({
       // canvas, so they stay editable after saving). Sparkles draw last so
       // they sit on top of a caption, matching the on-screen layering.
       await loadFontsFor(textTool.items)
+      await loadPlatesFor(glitterTool.items)
       const scratch = document.createElement('canvas')
       scratch.width = source.width
       scratch.height = source.height

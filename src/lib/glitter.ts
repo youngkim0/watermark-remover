@@ -1,7 +1,18 @@
 // Glitter overlay items: decorative sparkles drawn onto a canvas with the same
 // routine for the live preview and the exported PNG, so what you see is
-// exactly what you save. Shapes are canvas paths (no assets), authored in a
-// unit circle of radius 1 and scaled to the item's size at draw time.
+// exactly what you save.
+//
+// Sparkles are drawn as LIGHT, not as paint: inside one sparkle the layers
+// accumulate with 'lighter', so a hot white core sits inside a tinted bloom
+// with tapered, chromatically-split spikes. That shading is what separates a
+// sparkle from a sticker.
+//
+// The overlay canvas itself composites normally, NOT with a screen blend.
+// Screening was tried and rejected: on a dark photo it is indistinguishable
+// from compositing normally, and on a light one it washes every sparkle away —
+// and most photos have bright areas.
+import { SHAPE_DEFS, rng } from '@/lib/glitterShapes'
+import { loadPlates, type PlateId } from '@/lib/glitterPlates'
 
 export type GlitterShape =
   | 'spark'
@@ -14,6 +25,15 @@ export type GlitterShape =
   | 'diamond'
   | 'heart'
   | 'snowflake'
+  | 'flare'
+  | 'prism'
+  | 'halo'
+  | 'shimmer'
+  | 'comet'
+  | 'glint'
+  | 'grain'
+  | 'lensflare'
+  | 'bokehPlate'
 
 export type GlitterItem = {
   id: number
@@ -26,278 +46,137 @@ export type GlitterItem = {
   seed: number // stable randomness for multi-element shapes
 }
 
-/** Palette order — also the order the toolbar strip renders. */
+/** Palette order — also the order the toolbar strip renders. Points of light
+ *  first, then objects, then the wide/atmospheric ones. */
 export const GLITTER_SHAPES: GlitterShape[] = [
   'spark',
-  'star',
-  'twinkle',
+  'glint',
   'burst',
+  'twinkle',
+  'star',
+  'prism',
   'dust',
+  'shimmer',
+  'comet',
+  'flare',
   'bokeh',
+  'halo',
   'ring',
   'diamond',
   'heart',
   'snowflake',
+  'grain',
+  'lensflare',
+  'bokehPlate',
 ]
 
 const TAU = Math.PI * 2
 
-/** mulberry32 — small, fast, deterministic. `dust` must scatter its specks
- *  identically on every redraw and in the export, so draw-time randomness is
- *  always seeded from the item, never from Math.random(). */
-function rng(seed: number): () => number {
-  let t = seed >>> 0
-  return () => {
-    t = (t + 0x6d2b79f5) >>> 0
-    let r = Math.imul(t ^ (t >>> 15), 1 | t)
-    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-/** #rrggbb (or #rgb) → rgba() at the given alpha. */
-function withAlpha(hex: string, alpha: number): string {
-  let h = hex.replace('#', '')
-  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]
-  const n = parseInt(h, 16)
-  if (h.length !== 6 || Number.isNaN(n)) return `rgba(255,255,255,${alpha})`
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`
-}
-
-/** The soft light bloom every shape sits on. Without it a flat fill reads as
- *  a pasted icon rather than as light. */
-function halo(ctx: CanvasRenderingContext2D, color: string, alpha: number) {
-  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1)
-  g.addColorStop(0, withAlpha(color, alpha))
-  g.addColorStop(0.45, withAlpha(color, alpha * 0.45))
-  g.addColorStop(1, withAlpha(color, 0))
-  ctx.fillStyle = g
-  ctx.beginPath()
-  ctx.arc(0, 0, 1, 0, TAU)
-  ctx.fill()
-}
-
-/** A star whose edges pinch toward the center through `waist`. `radii` gives
- *  one radius per tip (evenly spaced from straight up), so a 4-tip star with
- *  two short tips becomes a lens-flare cross. */
-function pinchedStar(ctx: CanvasRenderingContext2D, radii: number[], waist: number) {
-  const n = radii.length
-  ctx.beginPath()
-  for (let i = 0; i < n; i++) {
-    const a = -Math.PI / 2 + (i / n) * TAU
-    const next = -Math.PI / 2 + ((i + 1) / n) * TAU
-    const mid = (a + next) / 2
-    const x = Math.cos(a) * radii[i]
-    const y = Math.sin(a) * radii[i]
-    if (i === 0) ctx.moveTo(x, y)
-    else ctx.lineTo(x, y)
-    const nx = Math.cos(next) * radii[(i + 1) % n]
-    const ny = Math.sin(next) * radii[(i + 1) % n]
-    ctx.quadraticCurveTo(Math.cos(mid) * waist, Math.sin(mid) * waist, nx, ny)
-  }
-  ctx.closePath()
-  ctx.fill()
-}
-
-/** A straight-edged polygon star: `points` tips at radius 1 alternating with
- *  valleys at `inner`. */
-function polygonStar(ctx: CanvasRenderingContext2D, points: number, inner: number) {
-  ctx.beginPath()
-  for (let i = 0; i < points * 2; i++) {
-    const a = -Math.PI / 2 + (i / (points * 2)) * TAU
-    const r = i % 2 === 0 ? 1 : inner
-    const x = Math.cos(a) * r
-    const y = Math.sin(a) * r
-    if (i === 0) ctx.moveTo(x, y)
-    else ctx.lineTo(x, y)
-  }
-  ctx.closePath()
-  ctx.fill()
-}
-
-/** Crossed tapered spikes — a needle star. Unlike `pinchedStar`, whose waist
- *  is dominated by its endpoints, each spike is its own slim shape, so the
- *  star stays fine however many spikes it has. */
-function needleStar(ctx: CanvasRenderingContext2D, spikes: number, halfWidth: number) {
-  for (let i = 0; i < spikes; i++) {
-    ctx.save()
-    ctx.rotate((i / spikes) * Math.PI)
-    ctx.beginPath()
-    ctx.moveTo(0, -1)
-    ctx.quadraticCurveTo(halfWidth, 0, 0, 1)
-    ctx.quadraticCurveTo(-halfWidth, 0, 0, -1)
-    ctx.closePath()
-    ctx.fill()
-    ctx.restore()
-  }
-}
-
-type Draw = (ctx: CanvasRenderingContext2D, item: GlitterItem) => void
-
-const SHAPES: Record<GlitterShape, Draw> = {
-  // 1. ✦ classic four-point sparkle.
-  spark: (ctx, item) => {
-    halo(ctx, item.color, 0.3)
-    ctx.fillStyle = item.color
-    pinchedStar(ctx, [1, 1, 1, 1], 0.18)
-  },
-
-  // 2. ★ five-point star, straight edges.
-  star: (ctx, item) => {
-    halo(ctx, item.color, 0.26)
-    ctx.fillStyle = item.color
-    polygonStar(ctx, 5, 0.42)
-  },
-
-  // 3. ✳ fine six-point needle star.
-  twinkle: (ctx, item) => {
-    halo(ctx, item.color, 0.28)
-    ctx.fillStyle = item.color
-    needleStar(ctx, 3, 0.18)
-  },
-
-  // 4. Lens-flare cross: long vertical rays, short horizontal, bright core.
-  burst: (ctx, item) => {
-    halo(ctx, item.color, 0.35)
-    ctx.fillStyle = item.color
-    pinchedStar(ctx, [1, 0.5, 1, 0.5], 0.06)
-    const core = ctx.createRadialGradient(0, 0, 0, 0, 0, 0.24)
-    core.addColorStop(0, 'rgba(255,255,255,0.95)')
-    core.addColorStop(1, withAlpha(item.color, 0))
-    ctx.fillStyle = core
-    ctx.beginPath()
-    ctx.arc(0, 0, 0.24, 0, TAU)
-    ctx.fill()
-  },
-
-  // 5. Scattered glitter specks — positions fixed by the item's seed.
-  dust: (ctx, item) => {
-    halo(ctx, item.color, 0.16)
-    const rand = rng(item.seed)
-    for (let i = 0; i < 9; i++) {
-      const a = rand() * TAU
-      const r = 0.15 + rand() * 0.7
-      const dot = 0.05 + rand() * 0.07
-      ctx.fillStyle = withAlpha(item.color, 0.5 + rand() * 0.5)
-      ctx.beginPath()
-      ctx.arc(Math.cos(a) * r, Math.sin(a) * r, dot, 0, TAU)
-      ctx.fill()
-    }
-    for (let i = 0; i < 2; i++) {
-      const a = rand() * TAU
-      const r = rand() * 0.5
-      ctx.save()
-      ctx.translate(Math.cos(a) * r, Math.sin(a) * r)
-      ctx.rotate(rand() * TAU)
-      ctx.scale(0.32, 0.32)
-      ctx.fillStyle = item.color
-      pinchedStar(ctx, [1, 1, 1, 1], 0.18)
-      ctx.restore()
-    }
-  },
-
-  // 6. Soft out-of-focus light orb.
-  bokeh: (ctx, item) => {
-    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1)
-    g.addColorStop(0, withAlpha(item.color, 0.16))
-    g.addColorStop(0.82, withAlpha(item.color, 0.28))
-    g.addColorStop(0.92, withAlpha(item.color, 0.5))
-    g.addColorStop(1, withAlpha(item.color, 0))
-    ctx.fillStyle = g
-    ctx.beginPath()
-    ctx.arc(0, 0, 1, 0, TAU)
-    ctx.fill()
-  },
-
-  // 7. Thin halo ring, alpha falling off around the sweep.
-  ring: (ctx, item) => {
-    halo(ctx, item.color, 0.14)
-    const g = ctx.createLinearGradient(-1, -1, 1, 1)
-    g.addColorStop(0, withAlpha(item.color, 0.95))
-    g.addColorStop(1, withAlpha(item.color, 0.15))
-    ctx.strokeStyle = g
-    ctx.lineWidth = 0.07
-    ctx.beginPath()
-    ctx.arc(0, 0, 0.8, 0, TAU)
-    ctx.stroke()
-  },
-
-  // 8. Gem: rhombus with a lighter facet.
-  diamond: (ctx, item) => {
-    halo(ctx, item.color, 0.24)
-    ctx.fillStyle = item.color
-    ctx.beginPath()
-    ctx.moveTo(0, -1)
-    ctx.lineTo(0.62, 0)
-    ctx.lineTo(0, 1)
-    ctx.lineTo(-0.62, 0)
-    ctx.closePath()
-    ctx.fill()
-    ctx.fillStyle = 'rgba(255,255,255,0.4)'
-    ctx.beginPath()
-    ctx.moveTo(0, -1)
-    ctx.lineTo(0.62, 0)
-    ctx.lineTo(0, -0.1)
-    ctx.closePath()
-    ctx.fill()
-  },
-
-  // 9. Glossy heart.
-  heart: (ctx, item) => {
-    halo(ctx, item.color, 0.24)
-    ctx.fillStyle = item.color
-    ctx.beginPath()
-    ctx.moveTo(0, 0.92)
-    ctx.bezierCurveTo(-1.05, 0.08, -0.58, -0.98, 0, -0.34)
-    ctx.bezierCurveTo(0.58, -0.98, 1.05, 0.08, 0, 0.92)
-    ctx.closePath()
-    ctx.fill()
-    ctx.fillStyle = 'rgba(255,255,255,0.45)'
-    ctx.beginPath()
-    ctx.ellipse(-0.34, -0.3, 0.16, 0.1, -0.6, 0, TAU)
-    ctx.fill()
-  },
-
-  // 10. ❄ six-arm crystal.
-  snowflake: (ctx, item) => {
-    halo(ctx, item.color, 0.2)
-    ctx.strokeStyle = item.color
-    ctx.lineWidth = 0.09
-    ctx.lineCap = 'round'
-    for (let i = 0; i < 6; i++) {
-      ctx.save()
-      ctx.rotate((i / 6) * TAU)
-      ctx.beginPath()
-      ctx.moveTo(0, 0)
-      ctx.lineTo(0, -0.95)
-      ctx.stroke()
-      for (const [at, len] of [
-        [0.42, 0.24],
-        [0.68, 0.17],
-      ] as const) {
-        ctx.beginPath()
-        ctx.moveTo(0, -at)
-        ctx.lineTo(Math.sin(0.6) * len, -at - Math.cos(0.6) * len)
-        ctx.moveTo(0, -at)
-        ctx.lineTo(-Math.sin(0.6) * len, -at - Math.cos(0.6) * len)
-        ctx.stroke()
-      }
-      ctx.restore()
-    }
-  },
+/** How far a shape may rotate at placement. A shape with a canonical "up"
+ *  gets a small tilt; the rest take a full turn so a cluster never looks
+ *  stamped. The symmetric shapes cost nothing to rotate freely — a 5-point
+ *  star's full turn is visually ±36°, a 6-arm snowflake's ±30°, and dust,
+ *  bokeh, halo and ring look identical at any angle. A heart does not: it has
+ *  no rotational symmetry, so a full turn lands it upside down. */
+const ROTATION_JITTER: Record<GlitterShape, number> = {
+  spark: Math.PI,
+  star: Math.PI,
+  twinkle: Math.PI,
+  burst: Math.PI,
+  dust: Math.PI,
+  bokeh: Math.PI,
+  ring: Math.PI,
+  snowflake: Math.PI,
+  prism: Math.PI,
+  halo: Math.PI,
+  shimmer: Math.PI,
+  comet: Math.PI,
+  glint: Math.PI,
+  grain: Math.PI,
+  bokehPlate: Math.PI,
+  lensflare: 0.22, // as with `flare` — a streak only reads as a lens artifact near level
+  flare: 0.22, // ~12° — an anamorphic streak reads as a lens artifact only near level
+  diamond: 0.26, // ~15° — 2-fold symmetry, so a full turn tips it over
+  heart: 0.17, // ~10° — a slight tilt is charming, sideways is broken
 }
 
 export function drawGlitterItems(ctx: CanvasRenderingContext2D, items: GlitterItem[]) {
   for (const item of items) {
     const r = item.size / 2
     if (r <= 0) continue
+    const def = SHAPE_DEFS[item.shape]
+    const rand = rng(item.seed)
     ctx.save()
     ctx.translate(item.x, item.y)
     ctx.rotate(item.rotation)
     ctx.scale(r, r)
-    SHAPES[item.shape](ctx, item)
+
+    // A whisper of shade under the sparkle. On a dark photo this does
+    // nothing — there is nothing left to darken. On a bright one it is the
+    // only thing that lets a white highlight read at all, since a screen
+    // cannot draw brighter than white. Kept far below the threshold where it
+    // would look like a drop shadow.
+    ctx.save()
+    ctx.scale(1, def.shadeAspect ?? 1)
+    const shade = ctx.createRadialGradient(0, 0, 0, 0, 0, 0.8)
+    shade.addColorStop(0, 'rgba(30,24,12,0.1)')
+    shade.addColorStop(0.35, 'rgba(30,24,12,0.055)')
+    shade.addColorStop(1, 'rgba(30,24,12,0)')
+    ctx.fillStyle = shade
+    ctx.beginPath()
+    ctx.arc(0, 0, 0.8, 0, TAU)
+    ctx.fill()
+    ctx.restore()
+
+    // Light accumulates: two sparkles overlapping get brighter, they don't
+    // occlude each other.
+    ctx.globalCompositeOperation = 'lighter'
+
+    const satellites = def.satellites ?? 0
+    const anchor = satellites > 0 ? (def.anchor ?? 0.6) : 1
+    ctx.save()
+    ctx.scale(anchor, anchor)
+    def.draw(ctx, item, rand)
+    ctx.restore()
+
+    // Company. A lone symmetrical mark is the sticker tell; real glitter
+    // arrives as a constellation. Satellites stay inside radius 1 so the
+    // footprint measureGlitterItem promises remains truthful.
+    for (let i = 0; i < satellites; i++) {
+      const a = rand() * TAU
+      const s = 0.14 + rand() * 0.18
+      const d = Math.min(0.42 + rand() * 0.5, 1 - s)
+      ctx.save()
+      ctx.globalAlpha = 0.35 + rand() * 0.4
+      ctx.translate(Math.cos(a) * d, Math.sin(a) * d)
+      ctx.rotate(rand() * TAU)
+      ctx.scale(s, s)
+      def.draw(ctx, item, rand)
+      ctx.restore()
+    }
     ctx.restore()
   }
+}
+
+/** Which photographic plates a set of items needs. */
+const PLATE_OF: Partial<Record<GlitterShape, PlateId>> = {
+  grain: 'grain',
+  lensflare: 'lensflare',
+  bokehPlate: 'bokehPlate',
+}
+
+/**
+ * Load the plates these items need. A plate shape draws nothing until its
+ * image is in memory, so the overlay redraws once this resolves and the
+ * exporter awaits it — the same contract the text tool has with its fonts.
+ */
+export function loadPlatesFor(items: GlitterItem[]): Promise<unknown> {
+  const ids = new Set<PlateId>()
+  for (const it of items) {
+    const id = PLATE_OF[it.shape]
+    if (id) ids.add(id)
+  }
+  return loadPlates([...ids])
 }
 
 /** Bounding box (natural px) for hit-testing, selection chrome and erase
@@ -312,25 +191,7 @@ export function measureGlitterItem(item: GlitterItem): {
   return { x: item.x - item.size / 2, y: item.y - item.size / 2, w: item.size, h: item.size }
 }
 
-/** How far a shape may rotate at placement. A shape with a canonical "up"
- *  gets a small tilt; the rest take a full turn so a cluster never looks
- *  stamped. The symmetric shapes cost nothing to rotate freely — a 5-point
- *  star's full turn is visually ±36°, a 6-arm snowflake's ±30°, and dust,
- *  bokeh and ring look identical at any angle. A heart does not: it has no
- *  rotational symmetry, so a full turn lands it upside down. */
-const ROTATION_JITTER: Record<GlitterShape, number> = {
-  spark: Math.PI,
-  star: Math.PI,
-  twinkle: Math.PI,
-  burst: Math.PI,
-  dust: Math.PI,
-  bokeh: Math.PI,
-  ring: Math.PI,
-  snowflake: Math.PI,
-  diamond: 0.26, // ~15° — 2-fold symmetry, so a full turn tips it over
-  heart: 0.17, // ~10° — a slight tilt is charming, sideways is broken
-}
-
+/** Placement-time randomness, bounded per shape. */
 export function randomRotation(shape: GlitterShape): number {
   return (Math.random() * 2 - 1) * ROTATION_JITTER[shape]
 }

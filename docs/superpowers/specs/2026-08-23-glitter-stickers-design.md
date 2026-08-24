@@ -1,7 +1,10 @@
 # Glitter stickers — design
 
-Date: 2026-08-23
-Status: approved in brainstorming; not yet implemented.
+Date: 2026-08-23; rendering rebuilt 2026-08-24
+Status: shipped. The first version shipped on 2026-08-23 and read as flat
+stickers; the 2026-08-24 rebuild redraws every shape as light, adds six more
+procedural shapes and three photographic plates, and is recorded inline below
+rather than as a separate document.
 
 ## Problem
 
@@ -31,11 +34,11 @@ Four questions were asked; the answers below are the user's, not defaults.
 Two decisions made while designing, called out because they are the ones most
 worth overriding:
 
-- **No blend modes.** Real glitter would read better composited with `screen`
-  onto the photo, but the overlay lives on its own canvas, so a blend would
-  have to be reproduced by hand at export time and would erase any dark-tinted
-  sparkle. Shapes are drawn source-over with a soft radial halo instead:
-  WYSIWYG holds for free, and any color works.
+- **No blend modes on the overlay.** Originally chosen to keep preview and
+  export identical; re-tested on 2026-08-24 by shipping a `screen` version and
+  looking at it, and confirmed for a better reason: screening is
+  indistinguishable from normal compositing on a dark photo and destroys the
+  sparkle on a light one. Light accumulates *within* an item instead.
 - **The tool button is the word `glitter`, with no ✦ glyph.** That glyph
   already means "the watermark we detect and remove" in this toolbar
   (`✦ detect`); it must not also mean "the sparkle you add".
@@ -46,7 +49,9 @@ Four pieces, mirroring the text tool so the editor stays one pattern:
 
 | File | Role |
 |---|---|
-| `src/lib/glitter.ts` (new) | `GlitterItem` type, shape registry, `drawGlitterItems`, `measureGlitterItem`. Pure canvas, no React, no assets. |
+| `src/lib/glitter.ts` | `GlitterItem` type, palette order, `drawGlitterItems`, `measureGlitterItem`, plate loading. |
+| `src/lib/glitterShapes.ts` | The nineteen drawers and their shared light primitives (bloom, core, spike, chromatic spike, luminous body). |
+| `src/lib/glitterPlates.ts` | Loading, luminance-to-alpha conversion, tinting and caching of the photographic plates. |
 | `src/lib/useGlitterTool.ts` (new) | State + pointer interactions: place, hit-test, select, drag, update, delete, crop-shift, restore, remove-covered. |
 | `src/components/GlitterControls.tsx` (new) | Toolbar shown while the tool is active. |
 | `src/components/Editor.tsx` | Wiring: `tool` union, new canvas layer, export / crop / undo / erase hookups. |
@@ -98,39 +103,98 @@ It is rotation-invariant because every shape is drawn inside its inscribed
 circle, which keeps hit-testing, the selection ring and erase-coverage all
 trivial and consistent with each other.
 
-## The ten shapes
+## The shapes (rebuilt 2026-08-24)
 
-Each is a `draw(ctx, item)` in a `Record<GlitterShape, ...>` registry, drawn
-in a saved/restored context translated to `(x, y)`, rotated by `rotation`, and
-scaled so the shape is authored once in a unit circle of radius 1.
+The first version drew each shape as a flat tinted fill with a soft halo, and
+it read as a sticker pasted on the photo — which is what it was. The rebuild
+draws every sparkle as **light**, in layers that accumulate with `'lighter'`
+inside the item:
 
-| # | id | Reads as | Construction |
-|---|---|---|---|
-| 1 | `spark` | ✦ classic 4-point sparkle | 4 tips joined by quadratic curves pinched toward the center |
-| 2 | `star` | ★ 5-point star | 10 alternating radii, straight edges |
-| 3 | `twinkle` | ✳ fine 6-point needle star | 3 crossed tapered spikes, each its own slim shape |
-| 4 | `burst` | lens-flare cross | 2 long + 2 short tapered rays over a bright gradient core |
-| 5 | `dust` | scattered glitter specks | seeded scatter of ~9 dots + 2 mini sparks |
-| 6 | `bokeh` | soft out-of-focus light orb | one radial gradient, brightest just inside the rim, fading to nothing at the edge |
-| 7 | `ring` | thin halo ring | stroked circle with alpha falling off around the sweep |
-| 8 | `diamond` | gem | rhombus plus a lighter facet triangle |
-| 9 | `heart` | glossy heart | two arcs with a small specular highlight |
-| 10 | `snowflake` | ❄ six-arm crystal | 6 arms, two branch pairs each |
+```
+shade   a whisper of dark under everything, source-over
+halo    wide, low-alpha, tinted
+bloom   tighter, brighter, tinted, steep (inverse-square-ish) falloff
+body    the shape's geometry, near-white
+core    small, pure white, the hottest point
+```
 
-Every shape paints a soft radial halo first — `color` at ~0.35 alpha fading to
-transparent at `size/2` — then the mark itself at full alpha. That is what
-makes a flat fill read as light rather than as a pasted icon.
+Three details carry most of the difference:
 
-Rotation is randomized at placement so a cluster never looks stamped, but
-bounded per shape. The eight symmetric shapes take a full turn — a 5-point
-star's full turn is visually only ±36°, a 6-arm snowflake's ±30°, and dust,
-bokeh and ring look identical at any angle. `heart` (no rotational symmetry)
-and `diamond` (2-fold) have a canonical "up", so they get a small tilt
-instead; a heart at a random angle lands upside down.
+- **The core is white whatever the tint.** A real specular highlight clips to
+  white and only its falloff is coloured. A uniformly tinted mark cannot look
+  like light.
+- **Spikes are lens-shaped and chromatically split** — each drawn three times,
+  warm and cool offset by a few percent of its length. That fringing is why a
+  highlight reads as glass rather than vinyl.
+- **A tap places a constellation, not a mark.** Shapes with `satellites` draw
+  an anchor plus seeded companions at reduced brightness. It is still one
+  `GlitterItem` — one thing to select, drag and delete — and the satellites
+  stay inside radius 1 so the footprint contract holds.
 
-Adding, removing or swapping a shape is one function plus one union member and
-nothing else. Likely alternates if any of the ten underperform: `confetti`
-(curled ribbon strip), `flower` (5 petals), `bubble`, `plus` (fine 4-ray cross).
+### Compositing: not a screen blend
+
+Screening the overlay onto the photo was tried and rejected. On a dark photo
+it is indistinguishable from compositing normally; on a light one it washes
+every sparkle away, and most photos have bright areas. The overlay composites
+source-over; the light quality comes from the layered shading, not the blend.
+
+The same reasoning drives the **shade** layer: a screen cannot draw brighter
+than white, so on a pale photo a white highlight has no contrast to work with.
+A very faint dark radial under each sparkle — far below drop-shadow strength,
+and invisible on a dark frame — is what lets it read at all. The default tint
+is a saturated gold for the same reason.
+
+### Roster
+
+Sixteen procedural, three photographic. Palette order runs points of light
+first, then objects, then the wide and atmospheric ones.
+
+| id | Reads as |
+|---|---|
+| `spark` | four long chromatic spikes + four short diagonals |
+| `glint` | fine star-filter cross on a hard little light |
+| `burst` | cinematic lens star: long vertical, short horizontal |
+| `twinkle` | six fine needles of uneven length |
+| `star` | ★ five-point star, shaded as a luminous body |
+| `prism` | refraction — spikes split into spectral colours |
+| `dust` | glitter powder: 26 grains, each with its own bloom |
+| `shimmer` | a field of fine crossed glints |
+| `comet` | bright head with a tapering dust trail |
+| `flare` | anamorphic streak with a hot core |
+| `bokeh` | defocused hexagonal aperture, hollow, bright rim |
+| `halo` | pure glow, no geometry |
+| `ring` | luminous ring with a glint where it catches the light |
+| `diamond` | gem with a refraction spike |
+| `heart` | glossy heart |
+| `snowflake` | ❄ six-arm crystal with a tinted glow along the arms |
+| `grain` | **plate** — photographed glitter powder |
+| `lensflare` | **plate** — photographed anamorphic flare |
+| `bokehPlate` | **plate** — photographed defocused bokeh, keeps its own colours |
+
+### The photographic plates
+
+Three plates generated with Higgsfield and shipped in `public/glitter/`
+(~207KB total). Procedural shapes can imitate the geometry of light but not
+its texture; these carry grain a canvas path cannot.
+
+They are lit subjects on pure black, so `glitterPlates.ts` converts luminance
+to alpha at build time — otherwise the dark half of the frame composites as an
+opaque box around the sparkle. RGB is renormalised so a dim pixel goes
+transparent rather than muddy. The result is tinted, feathered to a disc, and
+cached per (plate, colour); `bokehPlate` takes only a light tint wash because
+its multi-coloured spill is the point of it.
+
+Because a plate draws nothing until its image is in memory, `loadPlatesFor`
+mirrors the text tool's font contract: the overlay redraws when a plate lands,
+and the exporter awaits it, so a saved PNG can never contain a half-loaded
+sparkle.
+
+Rotation is randomized at placement, bounded per shape. The eight symmetric
+shapes take a full turn — a 5-point star's full turn is visually only ±36°, a
+6-arm snowflake's ±30°, and dust, bokeh, halo and ring look identical at any
+angle. `heart` (no rotational symmetry), `diamond` (2-fold), and the two
+streaks (`flare`, `lensflare`, which read as lens artifacts only near level)
+get a small tilt instead.
 
 ## Interaction
 
