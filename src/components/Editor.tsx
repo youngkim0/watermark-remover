@@ -18,6 +18,8 @@ import ZoomControls from './ZoomControls'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
+import { useGlitterTool } from '@/lib/useGlitterTool'
+import { measureGlitterItem } from '@/lib/glitter'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -140,6 +142,7 @@ export default function Editor({
   const origCanvasRef = useRef<HTMLCanvasElement>(null)
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
   const textCanvasRef = useRef<HTMLCanvasElement>(null)
+  const glitterCanvasRef = useRef<HTMLCanvasElement>(null)
   const imgBoxRef = useRef<HTMLDivElement>(null)
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
@@ -160,13 +163,15 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
-  const [tool, setTool] = useState<'erase' | 'text'>('erase')
+  const [tool, setTool] = useState<'erase' | 'text' | 'glitter'>('erase')
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
   const cropUndo = useRef<CropUndo | null>(null)
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
   const { reset: resetText, removeCovered: removeCoveredText } = textTool
+  const glitterTool = useGlitterTool({ canvasRef: glitterCanvasRef, dims })
+  const { reset: resetGlitter } = glitterTool
 
   const onModelProgress = useCallback((p: InpaintProgress) => {
     if (p.stage === 'download') {
@@ -210,7 +215,7 @@ export default function Editor({
         const w = Math.round(bmp.width * scale)
         const h = Math.round(bmp.height * scale)
         if (!alive) return
-        for (const ref of [imgCanvasRef, origCanvasRef, maskCanvasRef, textCanvasRef]) {
+        for (const ref of [imgCanvasRef, origCanvasRef, maskCanvasRef, textCanvasRef, glitterCanvasRef]) {
           const c = ref.current!
           c.width = w
           c.height = h
@@ -225,6 +230,7 @@ export default function Editor({
         eraseHistory.current = []
         cropUndo.current = null
         resetText()
+        resetGlitter()
         setTool('erase')
         setOriginalDims({ w, h })
         setCropUndoAvailable(false)
@@ -246,7 +252,7 @@ export default function Editor({
     return () => {
       alive = false
     }
-  }, [file, resetText])
+  }, [file, resetText, resetGlitter])
 
   // Fit the canvas wrapper to the stage.
   useEffect(() => {
@@ -308,6 +314,10 @@ export default function Editor({
       textTool.onPointerDown(e)
       return
     }
+    if (tool === 'glitter') {
+      glitterTool.onPointerDown(e)
+      return
+    }
     e.currentTarget.setPointerCapture(e.pointerId)
     setDetectResult(null)
     setMaskActions((n) => n + 1)
@@ -330,6 +340,10 @@ export default function Editor({
       textTool.onPointerMove(e)
       return
     }
+    if (tool === 'glitter') {
+      glitterTool.onPointerMove(e)
+      return
+    }
     const rect = maskCanvasRef.current!.getBoundingClientRect()
     const z = fit.w ? rect.width / fit.w : 1
     setCursor({ x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z, z })
@@ -345,6 +359,7 @@ export default function Editor({
 
   const endStroke = () => {
     textTool.onPointerUp()
+    glitterTool.onPointerUp()
     drawState.current.active = false
   }
 
@@ -625,6 +640,18 @@ export default function Editor({
     setTool('erase')
   }
 
+  const enterGlitter = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    setTool('glitter')
+    track('glitter-open')
+  }
+
+  const exitGlitter = () => {
+    glitterTool.deselect()
+    setTool('erase')
+  }
+
   // Adding/switching items also goes through blur-first so the current
   // inline edit commits before the editor moves to another item.
   const addTextItem = () => {
@@ -742,6 +769,13 @@ export default function Editor({
         (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.isContentEditable)
       )
         return
+      if (tool === 'glitter') {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+          e.preventDefault()
+          glitterTool.undoLast()
+        }
+        return
+      }
       if (tool !== 'erase') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
@@ -775,6 +809,10 @@ export default function Editor({
 
   const status = cropping
     ? 'drag to select the area to keep'
+    : tool === 'glitter'
+    ? glitterTool.items.length === 0
+      ? 'tap the image to add sparkle'
+      : 'tap to add more — drag a sparkle to move it'
     : tool === 'text'
     ? textTool.editing
       ? 'type your text — tap outside when finished'
@@ -817,6 +855,9 @@ export default function Editor({
           />
           {/* text overlay — under the compare plane so "original" hides it */}
           <canvas ref={textCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+          {/* glitter overlay — above text so a sparkle can sit on a caption,
+              still under the compare plane so "original" hides it */}
+          <canvas ref={glitterCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
           <canvas
             ref={origCanvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none transition-opacity duration-100"
@@ -869,6 +910,24 @@ export default function Editor({
               <div
                 aria-hidden
                 className="absolute pointer-events-none border border-dashed"
+                style={{
+                  left: b.x / displayScale - 4,
+                  top: b.y / displayScale - 4,
+                  width: b.w / displayScale + 8,
+                  height: b.h / displayScale + 8,
+                  borderColor: 'var(--amber-soft)',
+                }}
+              />
+            )
+          })()}
+          {/* glitter selection ring — local space, so it tracks the sparkle
+              through zoom/pan like the canvases do. */}
+          {tool === 'glitter' && glitterTool.selected && dims && (() => {
+            const b = measureGlitterItem(glitterTool.selected)
+            return (
+              <div
+                aria-hidden
+                className="absolute pointer-events-none border border-dashed rounded-full"
                 style={{
                   left: b.x / displayScale - 4,
                   top: b.y / displayScale - 4,
@@ -971,6 +1030,33 @@ export default function Editor({
           onDelete={textTool.deleteSelected}
           onDone={exitText}
         />
+      ) : tool === 'glitter' ? (
+        <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+          <button
+            type="button"
+            className="ctrl label px-3 h-9 sm:h-10 cursor-pointer"
+            onClick={glitterTool.undoLast}
+            disabled={glitterTool.items.length === 0}
+          >
+            undo
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 h-9 sm:h-10 cursor-pointer"
+            onClick={glitterTool.deleteSelected}
+            disabled={!glitterTool.selected}
+          >
+            delete
+          </button>
+          <button
+            type="button"
+            onClick={exitGlitter}
+            className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer"
+            style={{ background: 'var(--amber)', color: '#181612', fontWeight: 500 }}
+          >
+            done
+          </button>
+        </div>
       ) : (
         <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
           <div className="ctrl flex items-center gap-2 sm:gap-3 px-3 sm:px-4 h-9 sm:h-10">
@@ -1003,6 +1089,14 @@ export default function Editor({
             disabled={busy}
           >
             text
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterGlitter}
+            disabled={busy}
+          >
+            glitter
           </button>
           <button
             type="button"
