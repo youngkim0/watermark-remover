@@ -1011,6 +1011,12 @@ export default function Editor({
       source = scratch
     }
     source.toBlob((blob) => {
+      // Drop a composited scratch plane now rather than at GC: on WebKit it
+      // lives in the GPU process, and repeated saves stacked ~100MB each.
+      if (source !== imgCanvasRef.current) {
+        source.width = 0
+        source.height = 0
+      }
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
