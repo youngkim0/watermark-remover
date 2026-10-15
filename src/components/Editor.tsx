@@ -16,6 +16,7 @@ import TextControls from './TextControls'
 import GlitterControls from './GlitterControls'
 import TextEditOverlay from './TextEditOverlay'
 import ZoomControls from './ZoomControls'
+import AdjustControls from './AdjustControls'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
@@ -26,6 +27,21 @@ import {
   measureGlitterItem,
   type GlitterItem,
 } from '@/lib/glitter'
+import {
+  IDENTITY_ORIENTATION,
+  composeOrientation,
+  inverseOrient,
+  isIdentityOrientation,
+  orientCanvas,
+  orientDims,
+  orientImageData,
+  orientPoint,
+  orientRect,
+  type OrientOp,
+  type Orientation,
+} from '@/lib/orient'
+import { NEUTRAL_ADJUST, isNeutralAdjust, sameAdjust, type Adjust } from '@/lib/adjust'
+import { AdjustRenderer } from '@/lib/adjustRenderer'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -56,15 +72,24 @@ type MaskStroke =
 // overlay items.
 type EraseUndo = { patches: InpaintPatch[]; texts: TextItem[]; glitters: GlitterItem[] }
 
+// The undo timeline below the mask strokes. A rotate/flip is lossless, so its
+// entry holds only the op (undo applies the inverse); an adjust entry holds
+// the slider values from before the panel was opened.
+type HistoryEntry =
+  | ({ kind: 'erase' } & EraseUndo)
+  | { kind: 'orient'; op: OrientOp }
+  | { kind: 'adjust'; prev: Adjust }
+
 // Single-level crop undo: the full pre-crop image + original planes, plus the
-// erase-undo stack that was valid against them. Kept only when it fits under
+// history that was valid against them. Kept only when it fits under
 // MAX_UNDO_BYTES (two full planes + copied patches); otherwise a crop is final.
 type CropUndo = {
   dims: Dims
   image: ImageData
   orig: ImageData
-  eraseHistory: EraseUndo[]
+  history: HistoryEntry[]
   eraseCountBefore: number
+  orientation: Orientation
   textItems: TextItem[]
   glitterItems: GlitterItem[]
 }
@@ -155,7 +180,33 @@ function clusterRects(rects: Rect[], gap: number): Rect[] {
   return out
 }
 
-const entryBytes = (g: EraseUndo) => g.patches.reduce((n, p) => n + p.data.data.byteLength, 0)
+const entryBytes = (g: HistoryEntry) =>
+  g.kind === 'erase' ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0) : 0
+
+/** A mask stroke on a `d`-sized image, re-expressed after a rotate/flip. */
+function orientStroke(s: MaskStroke, d: Dims, op: OrientOp): MaskStroke {
+  if (s.kind === 'detect') return { kind: 'detect', rects: s.rects.map((r) => orientRect(r, d, op)) }
+  return { ...s, points: s.points.map((p) => orientPoint(p.x, p.y, d, op)) }
+}
+
+/** An undo entry re-expressed after a rotate/flip, so it still lands where
+ *  its pixels and overlay items now are. */
+function orientEntry(e: HistoryEntry, d: Dims, op: OrientOp): HistoryEntry {
+  if (e.kind !== 'erase') return e
+  const move = <T extends { x: number; y: number }>(it: T): T => ({
+    ...it,
+    ...orientPoint(it.x, it.y, d, op),
+  })
+  return {
+    kind: 'erase',
+    patches: e.patches.map((p) => {
+      const r = orientRect({ x: p.x, y: p.y, w: p.data.width, h: p.data.height }, d, op)
+      return { x: r.x, y: r.y, data: orientImageData(p.data, op) }
+    }),
+    texts: e.texts.map(move),
+    glitters: e.glitters.map(move),
+  }
+}
 
 function fitContain(img: Dims, box: Dims): Dims {
   const scale = Math.min(box.w / img.w, box.h / img.h, 1)
@@ -175,12 +226,18 @@ export default function Editor({
   const maskCanvasRef = useRef<HTMLCanvasElement>(null)
   const textCanvasRef = useRef<HTMLCanvasElement>(null)
   const glitterCanvasRef = useRef<HTMLCanvasElement>(null)
+  const adjustCanvasRef = useRef<HTMLCanvasElement>(null)
   const imgBoxRef = useRef<HTMLDivElement>(null)
 
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskStrokes = useRef<MaskStroke[]>([])
-  const eraseHistory = useRef<EraseUndo[]>([])
+  const history = useRef<HistoryEntry[]>([])
   const busyRef = useRef(false)
+  const rendererRef = useRef<AdjustRenderer | null>(null)
+  // Slider values when the adjust panel opened, for its single undo entry.
+  const adjustAtOpen = useRef<Adjust>(NEUTRAL_ADJUST)
+  // A rotate changes dims; that must not re-run auto-detect.
+  const skipDetect = useRef(false)
 
   const [dims, setDims] = useState<Dims | null>(null)
   const [fit, setFit] = useState<Dims>({ w: 0, h: 0 })
@@ -195,7 +252,15 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
-  const [tool, setTool] = useState<'erase' | 'text' | 'glitter'>('erase')
+  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust'>('erase')
+  const [historyLen, setHistoryLen] = useState(0)
+  const [orientation, setOrientation] = useState<Orientation>(IDENTITY_ORIENTATION)
+  const [adjust, setAdjust] = useState<Adjust>(NEUTRAL_ADJUST)
+  // Bumped whenever the working pixels change, so the adjust layer knows to
+  // re-upload them.
+  const [imgVersion, setImgVersion] = useState(0)
+  // 'unknown' until the adjust panel first opens and tries to create WebGL2.
+  const [adjustGL, setAdjustGL] = useState<'unknown' | 'ready' | 'unavailable' | 'lost'>('unknown')
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
   const cropUndo = useRef<CropUndo | null>(null)
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
@@ -263,7 +328,7 @@ export default function Editor({
         }
         bmp.close()
         maskStrokes.current = []
-        eraseHistory.current = []
+        history.current = []
         cropUndo.current = null
         resetText()
         resetGlitter()
@@ -274,6 +339,10 @@ export default function Editor({
         setDetectResult(null)
         setMaskActions(0)
         setEraseCount(0)
+        setHistoryLen(0)
+        setOrientation(IDENTITY_ORIENTATION)
+        setAdjust(NEUTRAL_ADJUST)
+        setImgVersion((v) => v + 1)
         setError(null)
         setDims({ w, h })
         // One count per image actually opened in the editor ("processed").
@@ -464,6 +533,10 @@ export default function Editor({
   // if the user already started working (brush/crop/erase) before results.
   useEffect(() => {
     if (!dims) return
+    if (skipDetect.current) {
+      skipDetect.current = false
+      return
+    }
     let alive = true
     ;(async () => {
       if (maskStrokes.current.length > 0 || eraseCount > 0 || cropping) return
@@ -476,6 +549,23 @@ export default function Editor({
     // Re-run only when a new image (or crop) finishes sizing the canvas.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dims])
+
+  // Keep the adjust layer in step with the sliders and the working pixels;
+  // at neutral it gives its GPU planes back.
+  useEffect(() => {
+    const r = rendererRef.current
+    if (!r || adjustGL !== 'ready' || !dims) return
+    if (isNeutralAdjust(adjust)) r.release()
+    else r.draw(imgCanvasRef.current!, imgVersion, adjust)
+  }, [adjust, imgVersion, dims, adjustGL])
+
+  useEffect(
+    () => () => {
+      rendererRef.current?.dispose()
+      rendererRef.current = null
+    },
+    []
+  )
 
   /** Rebuild the mask canvas from the stroke list (after an undo). */
   const replayMask = (d: Dims) => {
@@ -492,6 +582,39 @@ export default function Editor({
     }
   }
 
+  /** Rotate/flip everything that lives in image coordinates: both pixel
+   *  planes, the mask strokes, every undo entry, and the overlay anchors.
+   *  Lossless, so undo is just the inverse op through the same path. */
+  const applyOrient = (op: OrientOp, record: boolean) => {
+    if (!dims) return
+    const d = dims
+    const nd = orientDims(d, op)
+    orientCanvas(imgCanvasRef.current!, op)
+    orientCanvas(origCanvasRef.current!, op)
+    for (const ref of [maskCanvasRef, textCanvasRef, glitterCanvasRef]) {
+      ref.current!.width = nd.w
+      ref.current!.height = nd.h
+    }
+    maskStrokes.current = maskStrokes.current.map((s) => orientStroke(s, d, op))
+    replayMask(nd)
+    history.current = history.current.map((e) => orientEntry(e, d, op))
+    textTool.applyOrient(op, d)
+    glitterTool.applyOrient(op, d)
+    if (record) history.current.push({ kind: 'orient', op })
+    setHistoryLen(history.current.length)
+    setOrientation((m) => composeOrientation(m, op))
+    setImgVersion((v) => v + 1)
+    skipDetect.current = true
+    setDims(nd)
+    view.fit()
+  }
+
+  const orient = (op: OrientOp) => {
+    if (busy || !dims || cropping) return
+    applyOrient(op, true)
+    track('rotate', { op })
+  }
+
   const undo = () => {
     if (busy || !dims || cropping) return
     if (maskStrokes.current.length > 0) {
@@ -502,15 +625,23 @@ export default function Editor({
       track('undo')
       return
     }
-    const prev = eraseHistory.current.pop()
+    const prev = history.current.pop()
     if (prev) {
-      const ctx = imgCanvasRef.current!.getContext('2d')!
-      for (let i = prev.patches.length - 1; i >= 0; i--) {
-        ctx.putImageData(prev.patches[i].data, prev.patches[i].x, prev.patches[i].y)
+      setHistoryLen(history.current.length)
+      if (prev.kind === 'orient') {
+        applyOrient(inverseOrient(prev.op), false)
+      } else if (prev.kind === 'adjust') {
+        setAdjust(prev.prev)
+      } else {
+        const ctx = imgCanvasRef.current!.getContext('2d')!
+        for (let i = prev.patches.length - 1; i >= 0; i--) {
+          ctx.putImageData(prev.patches[i].data, prev.patches[i].x, prev.patches[i].y)
+        }
+        textTool.addBack(prev.texts)
+        glitterTool.addBack(prev.glitters)
+        setEraseCount((n) => Math.max(0, n - 1))
+        setImgVersion((v) => v + 1)
       }
-      textTool.addBack(prev.texts)
-      glitterTool.addBack(prev.glitters)
-      setEraseCount((n) => Math.max(0, n - 1))
       track('undo')
       return
     }
@@ -531,11 +662,14 @@ export default function Editor({
       glitterCanvasRef.current!.width = c.dims.w
       glitterCanvasRef.current!.height = c.dims.h
       maskStrokes.current = []
-      eraseHistory.current = c.eraseHistory
+      history.current = c.history
       textTool.restore(c.textItems)
       glitterTool.restore(c.glitterItems)
       setMaskActions(0)
       setEraseCount(c.eraseCountBefore)
+      setHistoryLen(c.history.length)
+      setOrientation(c.orientation)
+      setImgVersion((v) => v + 1)
       setDims({ w: c.dims.w, h: c.dims.h })
       cropUndo.current = null
       setCropUndoAvailable(false)
@@ -629,15 +763,16 @@ export default function Editor({
       })
       setModel({ state: 'ready' })
       if (patches.length > 0 || removedTexts.length > 0 || removedGlitters.length > 0) {
-        eraseHistory.current.push({ patches, texts: removedTexts, glitters: removedGlitters })
+        history.current.push({ kind: 'erase', patches, texts: removedTexts, glitters: removedGlitters })
         committed = true
-        let bytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
+        let bytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
         while (
-          eraseHistory.current.length > MAX_UNDO ||
-          (bytes > MAX_UNDO_BYTES && eraseHistory.current.length > 1)
+          history.current.length > MAX_UNDO ||
+          (bytes > MAX_UNDO_BYTES && history.current.length > 1)
         ) {
-          bytes -= entryBytes(eraseHistory.current.shift()!)
+          bytes -= entryBytes(history.current.shift()!)
         }
+        setHistoryLen(history.current.length)
       }
       maskCtx().clearRect(0, 0, dims.w, dims.h)
       maskStrokes.current = []
@@ -648,12 +783,12 @@ export default function Editor({
       // Undo whatever this attempt already applied before it threw: the
       // overlay items were removed from hook state and the patches were
       // painted onto the canvas up top, and neither made it into
-      // eraseHistory, so nothing else will ever put them back. This does
+      // history, so nothing else will ever put them back. This does
       // NOT replay the mask — the strokes that were dropped to make room
       // for the overlay-item removal are mutated in place and out of scope
       // to reconstruct; only the pixels and the overlay items are restored.
       // Skipped once `committed` is true: from that point the work is in
-      // eraseHistory and `undo` owns reversing it, so rolling back here too
+      // history and `undo` owns reversing it, so rolling back here too
       // would double-restore.
       if (!committed) {
         if (patches.length > 0) {
@@ -669,6 +804,8 @@ export default function Editor({
       setError('Inpainting failed — try a smaller image or reload.')
       track('erase-error')
     } finally {
+      // Pixels changed (or were rolled back) — the adjust layer re-uploads.
+      if (patches.length > 0) setImgVersion((v) => v + 1)
       busyRef.current = false
       setBusy(false)
     }
@@ -722,6 +859,38 @@ export default function Editor({
     setTool('erase')
   }
 
+  const enterAdjust = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    // WebGL2 is set up on first use, so editors that never adjust never pay
+    // for a GL context.
+    let r = rendererRef.current
+    if (!r && adjustGL === 'unknown') {
+      r = AdjustRenderer.create(
+        adjustCanvasRef.current!,
+        () => setAdjustGL('lost'),
+        () => setAdjustGL('ready')
+      )
+      rendererRef.current = r
+    }
+    if (!r) setAdjustGL('unavailable')
+    else if (adjustGL !== 'lost') setAdjustGL(r.fits(dims) ? 'ready' : 'unavailable')
+    adjustAtOpen.current = adjust
+    setTool('adjust')
+    track('adjust-open')
+  }
+
+  const exitAdjust = () => {
+    // One undo step for the whole visit, however many slider moves it took.
+    if (!sameAdjust(adjust, adjustAtOpen.current)) {
+      history.current.push({ kind: 'adjust', prev: adjustAtOpen.current })
+      if (history.current.length > MAX_UNDO) history.current.shift()
+      setHistoryLen(history.current.length)
+      track('adjust', { sharp: adjust.sharp, light: adjust.light })
+    }
+    setTool('erase')
+  }
+
   // Adding/switching items also goes through blur-first so the current
   // inline edit commits before the editor moves to another item.
   const addTextItem = () => {
@@ -753,14 +922,15 @@ export default function Editor({
     // images this usually won't fit, so the crop is final — matching the
     // editor's existing "don't retain full-frame pixels on mobile" policy.
     const planeBytes = dims.w * dims.h * 4 * 2
-    const histBytes = eraseHistory.current.reduce((n, g) => n + entryBytes(g), 0)
+    const histBytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
         dims: { w: dims.w, h: dims.h },
         image: imgCtx.getImageData(0, 0, dims.w, dims.h),
         orig: origCtx.getImageData(0, 0, dims.w, dims.h),
-        eraseHistory: eraseHistory.current.slice(),
+        history: history.current.slice(),
         eraseCountBefore: eraseCount,
+        orientation,
         textItems: textTool.items,
         glitterItems: glitterTool.items,
       }
@@ -794,11 +964,13 @@ export default function Editor({
     glitterCanvasRef.current!.height = rect.h
 
     maskStrokes.current = []
-    eraseHistory.current = []
+    history.current = []
     textTool.applyCrop(rect)
     glitterTool.applyCrop(rect)
     setMaskActions(0)
     setEraseCount(0)
+    setHistoryLen(0)
+    setImgVersion((v) => v + 1)
     setDims({ w: rect.w, h: rect.h })
     setCropping(false)
     track('crop', { w: rect.w, h: rect.h })
@@ -814,7 +986,8 @@ export default function Editor({
       b.toString(16).padStart(2, '0')
     ).join('')
     let source: HTMLCanvasElement = imgCanvasRef.current!
-    if (textTool.items.length > 0 || glitterTool.items.length > 0) {
+    const adjusted = !isNeutralAdjust(adjust)
+    if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted) {
       // Composite the overlays into the export (they never touch the working
       // canvas, so they stay editable after saving). Sparkles draw last so
       // they sit on top of a caption, matching the on-screen layering.
@@ -824,7 +997,15 @@ export default function Editor({
       scratch.width = source.width
       scratch.height = source.height
       const ctx = scratch.getContext('2d')!
-      ctx.drawImage(source, 0, 0)
+      // The adjusted photo comes off the GL canvas, which is only readable in
+      // the same task it was drawn in — render and copy with no await between.
+      const r = rendererRef.current
+      if (adjusted && r && r.renderNow(source, imgVersion, adjust)) {
+        ctx.drawImage(r.canvas, 0, 0)
+      } else {
+        if (adjusted) setError('Adjustments could not be applied — saved without them.')
+        ctx.drawImage(source, 0, 0)
+      }
       drawTextItems(ctx, textTool.items)
       drawGlitterItems(ctx, glitterTool.items)
       source = scratch
@@ -885,12 +1066,20 @@ export default function Editor({
     eraseCount > 0 ||
     textTool.items.length > 0 ||
     glitterTool.items.length > 0 ||
+    !isIdentityOrientation(orientation) ||
+    !isNeutralAdjust(adjust) ||
     (dims !== null &&
       originalDims !== null &&
       (dims.w !== originalDims.w || dims.h !== originalDims.h))
 
+  const adjustLayerVisible = adjustGL === 'ready' && !isNeutralAdjust(adjust)
+
   const status = cropping
     ? 'drag to select the area to keep'
+    : tool === 'adjust'
+    ? adjustGL === 'ready'
+      ? 'rotate, flip, or slide to adjust'
+      : 'sliders unavailable here — rotate and flip still work'
     : tool === 'glitter'
     ? glitterTool.items.length === 0
       ? 'tap the image to add sparkle'
@@ -934,6 +1123,13 @@ export default function Editor({
             ref={imgCanvasRef}
             className="absolute inset-0 w-full h-full"
             style={{ boxShadow: '0 24px 80px rgba(0,0,0,0.55)' }}
+          />
+          {/* adjusted photo (blur/sharpen/brightness) — covers the working
+              canvas only while an adjustment is set; overlays sit above it */}
+          <canvas
+            ref={adjustCanvasRef}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ visibility: adjustLayerVisible ? 'visible' : 'hidden' }}
           />
           {/* text overlay — under the compare plane so "original" hides it */}
           <canvas ref={textCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
@@ -1112,6 +1308,15 @@ export default function Editor({
           onDelete={textTool.deleteSelected}
           onDone={exitText}
         />
+      ) : tool === 'adjust' ? (
+        <AdjustControls
+          adjust={adjust}
+          available={adjustGL === 'ready'}
+          onChange={(patch) => setAdjust((a) => ({ ...a, ...patch }))}
+          onOrient={orient}
+          onReset={() => setAdjust(NEUTRAL_ADJUST)}
+          onDone={exitAdjust}
+        />
       ) : tool === 'glitter' ? (
         <GlitterControls
           draft={glitterTool.draft}
@@ -1167,8 +1372,17 @@ export default function Editor({
           <button
             type="button"
             className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterAdjust}
+            disabled={busy}
+            data-active={!isNeutralAdjust(adjust)}
+          >
+            adjust
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
             onClick={undo}
-            disabled={busy || (maskActions === 0 && eraseCount === 0 && !cropUndoAvailable)}
+            disabled={busy || (maskActions === 0 && historyLen === 0 && !cropUndoAvailable)}
           >
             undo
           </button>

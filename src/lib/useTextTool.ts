@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
 import type { Rect } from '@/lib/inpaint'
+import { orientPoint, type OrientOp } from '@/lib/orient'
 
 type Dims = { w: number; h: number }
 
@@ -239,6 +240,12 @@ export function useTextTool({
     )
   }, [])
 
+  /** Move anchors with a rotate/flip of a `d`-sized image. Items keep their
+   *  own look — text stays upright, a sparkle keeps its angle. */
+  const applyOrient = useCallback((op: OrientOp, d: Dims) => {
+    setItems((list) => list.map((it) => ({ ...it, ...orientPoint(it.x, it.y, d, op) })))
+  }, [])
+
   const restore = useCallback((list: TextItem[]) => {
     setItems(list)
     setSelectedId(null)
@@ -266,6 +273,7 @@ export function useTextTool({
     deselect,
     reset,
     applyCrop,
+    applyOrient,
     restore,
   }
 }
