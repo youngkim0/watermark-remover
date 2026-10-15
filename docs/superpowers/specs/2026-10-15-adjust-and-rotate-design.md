@@ -60,7 +60,13 @@ is byte-for-byte today's editor.
 - WebGL2 missing, texture too large, or context lost → sliders disabled with
   "adjust unavailable"; rotation keeps working. Restored context re-uploads.
 
-Cost: three extra GPU planes at 14MP (~170MB), only while non-neutral.
+Cost: up to three extra GPU planes, only while non-neutral. Blurs with
+σ ≥ 8 run the intermediate plane at half resolution (a quarter of its memory;
+worst pixel 5.5/255 off a full-res Gaussian at the threshold, less above it).
+Measured on macOS WebKit with a 12MP photo (phys_footprint): WebContent +40MB;
+GPU process +115MB for brightness alone, ~+180–270MB with blur/sharpen, back to
++54MB after reset. The export's composited scratch canvas is zeroed after
+`toBlob` — left to GC, each save stacked ~100MB in the GPU process.
 
 ## Rotate / flip
 
