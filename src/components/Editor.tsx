@@ -19,6 +19,9 @@ import ZoomControls from './ZoomControls'
 import AdjustControls from './AdjustControls'
 import ExportControls from './ExportControls'
 import MosaicControls from './MosaicControls'
+import BgControls, { bgCss, type BgFill } from './BgControls'
+import { removeBackground, type BgProgress } from '@/lib/bgRemove'
+import type { AlphaPlane } from '@/lib/matte'
 import { applyMosaic, mosaicBlock, type BrushStroke } from '@/lib/mosaic'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
@@ -90,6 +93,8 @@ type HistoryEntry =
   | { kind: 'orient'; op: OrientOp }
   | { kind: 'adjust'; prev: Adjust }
   | { kind: 'mosaic'; patch: InpaintPatch }
+  | { kind: 'cutout-on' }
+  | { kind: 'cutout-off'; alpha: AlphaPlane }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // history that was valid against them. Kept only when it fits under
@@ -117,6 +122,8 @@ type RedoEntry =
   | { kind: 'adjust'; prev: Adjust; next: Adjust }
   | { kind: 'erase'; patches: InpaintPatch[]; texts: number[]; glitters: number[] }
   | { kind: 'mosaic'; patch: InpaintPatch }
+  | { kind: 'cutout-on'; alpha: AlphaPlane }
+  | { kind: 'cutout-off' }
   | { kind: 'crop'; rect: Rect }
 
 /** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
@@ -210,7 +217,34 @@ const entryBytes = (g: HistoryEntry | RedoEntry) =>
     ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0)
     : g.kind === 'mosaic'
       ? g.patch.data.data.byteLength
-      : 0
+      : 'alpha' in g
+        ? g.alpha.data.byteLength
+        : 0
+
+/** The alpha channel of a cutout canvas, one byte per pixel. */
+function readPlane(c: HTMLCanvasElement): AlphaPlane {
+  const px = c.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, c.width, c.height).data
+  const data = new Uint8Array(c.width * c.height)
+  for (let i = 0; i < data.length; i++) data[i] = px[i * 4 + 3]
+  return { w: c.width, h: c.height, data }
+}
+
+/** A cutout canvas (white, alpha from the plane) rebuilt from a plane. */
+function planeCanvas(p: AlphaPlane): HTMLCanvasElement {
+  const c = document.createElement('canvas')
+  c.width = p.w
+  c.height = p.h
+  const img = new ImageData(p.w, p.h)
+  for (let i = 0; i < p.data.length; i++) {
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = 255
+    img.data[i * 4 + 3] = p.data[i]
+  }
+  c.getContext('2d', { willReadFrequently: true })!.putImageData(img, 0, 0)
+  return c
+}
+
+const BG_PRESETS: Record<string, string> = { '#ffffff': 'white', '#000000': 'black' }
+const bgKind = (b: BgFill) => (b.kind === 'transparent' ? 'transparent' : (BG_PRESETS[b.color] ?? 'custom'))
 
 /** The pixels currently under `p`'s footprint, as a patch that restores them. */
 const snapshotPatch = (ctx: CanvasRenderingContext2D, p: InpaintPatch): InpaintPatch => ({
@@ -285,6 +319,8 @@ export default function Editor({
   const redoStack = useRef<RedoEntry[]>([])
   // The mosaic stroke being drawn; it applies on release.
   const mosaicStroke = useRef<BrushStroke | null>(null)
+  const alphaCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const cutCanvasRef = useRef<HTMLCanvasElement>(null)
   // Erase-mask strokes set aside while the mosaic tool is open, so its undo
   // reaches the mosaic steps rather than the pending mask first.
   const parkedStrokes = useRef<MaskStroke[]>([])
@@ -309,7 +345,13 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
-  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'mosaic' | 'export'>('erase')
+  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'mosaic' | 'bg' | 'export'>('erase')
+  // Background removal: the cutout is an alpha canvas beside the working
+  // pixels (never baked in), shown through cutCanvas over the fill.
+  const [cutout, setCutout] = useState(false)
+  const [bg, setBg] = useState<BgFill>({ kind: 'transparent' })
+  const [bgMode, setBgMode] = useState<'keep' | 'remove'>('keep')
+  const [bgLoad, setBgLoad] = useState<BgProgress | null>(null)
   const [mosaicLevel, setMosaicLevel] = useState(5)
   const [mosaicCount, setMosaicCount] = useState(0)
   const [historyLen, setHistoryLen] = useState(0)
@@ -415,6 +457,8 @@ export default function Editor({
         setMaskActions(0)
         setEraseCount(0)
         setMosaicCount(0)
+        setCutout(false)
+        alphaCanvasRef.current = null
         setHistoryLen(0)
         setRedoLen(0)
         setOrientation(IDENTITY_ORIENTATION)
@@ -686,6 +730,56 @@ export default function Editor({
     else r.draw(imgCanvasRef.current!, imgVersion, adjust)
   }, [adjust, imgVersion, dims, adjustGL])
 
+  /** Paint the visible cutout: `src` (the working pixels, or the adjust
+   *  layer while it's readable) masked by the alpha canvas. `dirty` limits
+   *  the repaint to a brush stroke's footprint. */
+  const composeCut = useCallback((src: HTMLCanvasElement, dirty?: Rect) => {
+    const cut = cutCanvasRef.current
+    const a = alphaCanvasRef.current
+    if (!cut || !a) return
+    if (cut.width !== src.width || cut.height !== src.height) {
+      cut.width = src.width
+      cut.height = src.height
+      dirty = undefined
+    }
+    const ctx = cut.getContext('2d')!
+    ctx.save()
+    if (dirty) {
+      ctx.beginPath()
+      ctx.rect(dirty.x, dirty.y, dirty.w, dirty.h)
+      ctx.clip()
+    }
+    ctx.globalCompositeOperation = 'copy'
+    ctx.drawImage(src, 0, 0)
+    ctx.globalCompositeOperation = 'destination-in'
+    ctx.drawImage(a, 0, 0)
+    ctx.restore()
+  }, [])
+
+  // While a cutout exists, every GL frame is folded into the cut view in
+  // the same task it was drawn (the GL canvas isn't readable afterwards).
+  useEffect(() => {
+    const r = rendererRef.current
+    if (!r) return
+    r.setAfterRender(cutout ? (gl) => composeCut(gl) : null)
+  }, [cutout, adjustGL, composeCut])
+
+  /** Re-render the cut view from whichever layer is showing the photo. */
+  const renderCutView = (dirty?: Rect) => {
+    if (!alphaCanvasRef.current || !dims) return
+    const r = rendererRef.current
+    if (adjustGL === 'ready' && !isNeutralAdjust(adjust) && r) {
+      // composeCut runs from the after-render hook.
+      if (r.renderNow(imgCanvasRef.current!, imgVersion, adjust)) return
+    }
+    composeCut(imgCanvasRef.current!, dirty)
+  }
+
+  useEffect(() => {
+    if (cutout) renderCutView()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cutout, imgVersion, dims, adjustGL, adjust])
+
   useEffect(
     () => () => {
       rendererRef.current?.dispose()
@@ -762,6 +856,14 @@ export default function Editor({
       } else if (prev.kind === 'adjust') {
         pushRedo({ kind: 'adjust', prev: prev.prev, next: adjustRef.current })
         setAdjust(prev.prev)
+      } else if (prev.kind === 'cutout-on') {
+        pushRedo({ kind: 'cutout-on', alpha: readPlane(alphaCanvasRef.current!) })
+        dropAlpha()
+        setCutout(false)
+      } else if (prev.kind === 'cutout-off') {
+        alphaCanvasRef.current = planeCanvas(prev.alpha)
+        pushRedo({ kind: 'cutout-off' })
+        setCutout(true)
       } else if (prev.kind === 'mosaic') {
         const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
         pushRedo({ kind: 'mosaic', patch: snapshotPatch(ctx, prev.patch) })
@@ -851,6 +953,16 @@ export default function Editor({
       setHistoryLen(history.current.length)
       setEraseCount((n) => n + 1)
       setImgVersion((v) => v + 1)
+    } else if (r.kind === 'cutout-on') {
+      alphaCanvasRef.current = planeCanvas(r.alpha)
+      history.current.push({ kind: 'cutout-on' })
+      setHistoryLen(history.current.length)
+      setCutout(true)
+    } else if (r.kind === 'cutout-off') {
+      history.current.push({ kind: 'cutout-off', alpha: readPlane(alphaCanvasRef.current!) })
+      setHistoryLen(history.current.length)
+      dropAlpha()
+      setCutout(false)
     } else if (r.kind === 'mosaic') {
       const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
       history.current.push({ kind: 'mosaic', patch: snapshotPatch(ctx, r.patch) })
@@ -1050,32 +1162,107 @@ export default function Editor({
     setTool('erase')
   }
 
+  /** Set a pending erase mask aside while a brush tool of its own is open,
+   *  so that tool's undo reaches its own steps first. */
+  const parkMask = () => {
+    if (!dims || maskStrokes.current.length === 0) return
+    // Redo steps may sit on top of the parked strokes; they'd replay
+    // against the wrong mask, so they go.
+    parkedStrokes.current = maskStrokes.current
+    maskStrokes.current = []
+    maskCtx().clearRect(0, 0, dims.w, dims.h)
+    clearRedo()
+  }
+
+  const unparkMask = () => {
+    if (!dims || parkedStrokes.current.length === 0) return
+    maskStrokes.current = parkedStrokes.current
+    parkedStrokes.current = []
+    replayMask(dims)
+  }
+
   const enterMosaic = () => {
     if (busy || !dims || cropping) return
     setCursor(null)
-    if (maskStrokes.current.length > 0) {
-      // Redo steps may sit on top of the parked strokes; they'd replay
-      // against the wrong mask, so they go.
-      parkedStrokes.current = maskStrokes.current
-      maskStrokes.current = []
-      maskCtx().clearRect(0, 0, dims.w, dims.h)
-      clearRedo()
-    }
+    parkMask()
     mosaicAtOpen.current = mosaicCount
     setTool('mosaic')
     track('mosaic-open')
   }
 
   const exitMosaic = () => {
-    if (dims && parkedStrokes.current.length > 0) {
-      maskStrokes.current = parkedStrokes.current
-      parkedStrokes.current = []
-      replayMask(dims)
-    }
+    unparkMask()
     if (mosaicCount !== mosaicAtOpen.current) {
       track('mosaic', { strokes: mosaicCount - mosaicAtOpen.current, level: mosaicLevel })
     }
     setTool('erase')
+  }
+
+  /** Push a history entry, trimming the oldest past the count/byte caps. */
+  const commitHistory = (e: HistoryEntry) => {
+    history.current.push(e)
+    let bytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
+    while (
+      history.current.length > MAX_UNDO ||
+      (bytes > MAX_UNDO_BYTES && history.current.length > 1)
+    ) {
+      bytes -= entryBytes(history.current.shift()!)
+    }
+    setHistoryLen(history.current.length)
+  }
+
+  const dropAlpha = () => {
+    const a = alphaCanvasRef.current
+    if (a) a.width = a.height = 0
+    alphaCanvasRef.current = null
+  }
+
+  const runBgRemoval = async () => {
+    if (busyRef.current || !dims) return
+    busyRef.current = true
+    setBusy(true)
+    setError(null)
+    try {
+      const { alpha, ep, ms } = await removeBackground(imgCanvasRef.current!, setBgLoad)
+      alphaCanvasRef.current = alpha
+      clearRedo()
+      commitHistory({ kind: 'cutout-on' })
+      setCutout(true)
+      track('bg-remove', { ms, ep })
+    } catch (err) {
+      console.error(err)
+      setError('Background removal failed — try a smaller image or reload.')
+      track('bg-error')
+    } finally {
+      busyRef.current = false
+      setBusy(false)
+      setBgLoad(null)
+    }
+  }
+
+  const enterBg = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    parkMask()
+    setTool('bg')
+    track('bg-open')
+    // One-shot: an existing cutout is refined, never re-run.
+    if (!cutout) void runBgRemoval()
+  }
+
+  const exitBg = () => {
+    unparkMask()
+    if (cutout) track('bg-background', { kind: bgKind(bg) })
+    setTool('erase')
+  }
+
+  const turnOffCutout = () => {
+    const a = alphaCanvasRef.current
+    if (busy || !a) return
+    clearRedo()
+    commitHistory({ kind: 'cutout-off', alpha: readPlane(a) })
+    dropAlpha()
+    setCutout(false)
   }
 
   const enterAdjust = () => {
@@ -1212,26 +1399,42 @@ export default function Editor({
     let source: HTMLCanvasElement = imgCanvasRef.current!
     const adjusted = !isNeutralAdjust(adjust)
     const opaque = prefs.format === 'jpeg'
-    if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted || opaque) {
+    const alpha = cutout ? alphaCanvasRef.current : null
+    if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted || opaque || alpha) {
       await loadFontsFor(textTool.items)
       await loadPlatesFor(glitterTool.items)
       const scratch = document.createElement('canvas')
       scratch.width = source.width
       scratch.height = source.height
       const ctx = scratch.getContext('2d')!
-      // JPEG has no alpha: transparent pixels would encode as black.
-      if (opaque) {
-        ctx.fillStyle = '#ffffff'
+      // A cutout's chosen fill goes underneath; otherwise JPEG (no alpha)
+      // gets white, since transparent pixels would encode as black.
+      const fill = alpha && bg.kind === 'color' ? bg.color : opaque ? '#ffffff' : null
+      if (fill) {
+        ctx.fillStyle = fill
         ctx.fillRect(0, 0, scratch.width, scratch.height)
       }
       // The adjusted photo comes off the GL canvas, which is only readable in
       // the same task it was drawn in — render and copy with no await between.
       const r = rendererRef.current
+      let photo: HTMLCanvasElement = source
       if (adjusted && r && r.renderNow(source, imgVersion, adjust)) {
-        ctx.drawImage(r.canvas, 0, 0)
+        photo = r.canvas
+      } else if (adjusted) {
+        setError('Adjustments could not be applied — saved without them.')
+      }
+      if (alpha) {
+        const cut = document.createElement('canvas')
+        cut.width = source.width
+        cut.height = source.height
+        const cctx = cut.getContext('2d')!
+        cctx.drawImage(photo, 0, 0)
+        cctx.globalCompositeOperation = 'destination-in'
+        cctx.drawImage(alpha, 0, 0)
+        ctx.drawImage(cut, 0, 0)
+        cut.width = cut.height = 0
       } else {
-        if (adjusted) setError('Adjustments could not be applied — saved without them.')
-        ctx.drawImage(source, 0, 0)
+        ctx.drawImage(photo, 0, 0)
       }
       // Sparkles draw last so they sit on top of a caption, matching the
       // on-screen layering.
@@ -1383,7 +1586,7 @@ export default function Editor({
         }
         return
       }
-      if (tool !== 'erase' && tool !== 'mosaic') return
+      if (tool !== 'erase' && tool !== 'mosaic' && tool !== 'bg') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
       const mod = e.metaKey || e.ctrlKey
@@ -1415,6 +1618,7 @@ export default function Editor({
   const hasEdit =
     eraseCount > 0 ||
     mosaicCount > 0 ||
+    cutout ||
     textTool.items.length > 0 ||
     glitterTool.items.length > 0 ||
     !isIdentityOrientation(orientation) ||
@@ -1448,6 +1652,14 @@ export default function Editor({
     ? 'choose a format — then download, copy or share'
     : tool === 'mosaic'
     ? 'brush over faces or text to pixelate them'
+    : tool === 'bg'
+    ? bgLoad?.stage === 'download'
+      ? `loading background model ${bgLoad.total ? Math.round((bgLoad.loaded / bgLoad.total) * 100) : 0}%`
+      : busy
+        ? 'removing background…'
+        : cutout
+          ? 'pick a background — brush keep or remove to fix the edges'
+          : 'background removal is off — open the tool again to re-run it'
     : tool === 'adjust'
     ? adjustGL === 'ready'
       ? 'rotate, flip, or slide to adjust'
@@ -1491,17 +1703,37 @@ export default function Editor({
           className="relative"
           style={{ width: fit.w || undefined, height: fit.h || undefined, willChange: 'transform' }}
         >
+          {/* cutout fill — checkerboard (transparent) or the chosen colour */}
+          {cutout && (
+            <div
+              aria-hidden
+              className="absolute inset-0 pointer-events-none"
+              style={{ background: bgCss(bg), boxShadow: '0 24px 80px rgba(0,0,0,0.55)' }}
+            />
+          )}
+          {/* working pixels — with a cutout they only show as a faint ghost
+              while the bg tool is open, so cut-away parts can be brushed back */}
           <canvas
             ref={imgCanvasRef}
             className="absolute inset-0 w-full h-full"
-            style={{ boxShadow: '0 24px 80px rgba(0,0,0,0.55)' }}
+            style={{
+              boxShadow: cutout ? undefined : '0 24px 80px rgba(0,0,0,0.55)',
+              opacity: cutout ? (tool === 'bg' ? 0.25 : 0) : 1,
+            }}
           />
           {/* adjusted photo (blur/sharpen/brightness) — covers the working
-              canvas only while an adjustment is set; overlays sit above it */}
+              canvas only while an adjustment is set; overlays sit above it.
+              With a cutout its frames go through the cut view instead. */}
           <canvas
             ref={adjustCanvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none"
-            style={{ visibility: adjustLayerVisible ? 'visible' : 'hidden' }}
+            style={{ visibility: adjustLayerVisible && !cutout ? 'visible' : 'hidden' }}
+          />
+          {/* cutout view — the photo masked by the alpha canvas */}
+          <canvas
+            ref={cutCanvasRef}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ visibility: cutout ? 'visible' : 'hidden' }}
           />
           {/* text overlay — under the compare plane so "original" hides it */}
           <canvas ref={textCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
@@ -1607,7 +1839,9 @@ export default function Editor({
           {/* processing veil */}
           {busy && (
             <div className="absolute inset-0 flex items-end justify-center pb-4 bg-black/30">
-              <span className="label text-amber pulse-dim">erasing…</span>
+              <span className="label text-amber pulse-dim">
+                {tool === 'bg' ? 'removing background…' : 'erasing…'}
+              </span>
             </div>
           )}
           {comparing && (
@@ -1721,6 +1955,27 @@ export default function Editor({
           onCopy={copy}
           onShare={share}
           onDone={() => setTool('erase')}
+          note={
+            cutout && bg.kind === 'transparent' && exportPrefs.format === 'jpeg'
+              ? 'jpg has no transparency — saved on white'
+              : undefined
+          }
+        />
+      ) : tool === 'bg' ? (
+        <BgControls
+          bg={bg}
+          mode={bgMode}
+          brush={brush}
+          ready={cutout && !busy}
+          canUndo={!busy && (historyLen > 0 || cropUndoAvailable)}
+          canRedo={!busy && redoLen > 0}
+          onBg={setBg}
+          onMode={setBgMode}
+          onBrush={setBrush}
+          onUndo={undo}
+          onRedo={redo}
+          onTurnOff={turnOffCutout}
+          onDone={exitBg}
         />
       ) : tool === 'mosaic' ? (
         <MosaicControls
@@ -1793,6 +2048,15 @@ export default function Editor({
             disabled={busy}
           >
             mosaic
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterBg}
+            disabled={busy}
+            data-active={cutout}
+          >
+            remove bg
           </button>
           <button
             type="button"

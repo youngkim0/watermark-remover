@@ -114,6 +114,7 @@ export class AdjustRenderer {
   private lost = false
   private raf = 0
   private pending: { source: HTMLCanvasElement; version: number; adjust: Adjust } | null = null
+  private afterRender: ((gl: HTMLCanvasElement) => void) | null = null
   readonly maxSize: number
 
   private constructor(
@@ -254,6 +255,12 @@ export class AdjustRenderer {
     })
   }
 
+  /** Run `fn` at the end of every successful render, while the GL canvas
+   *  is still readable — for consumers that composite it elsewhere. */
+  setAfterRender(fn: ((gl: HTMLCanvasElement) => void) | null) {
+    this.afterRender = fn
+  }
+
   /** Render synchronously. The result is readable (drawImage of `canvas`)
    *  until the current task ends. Returns false if nothing was drawn. */
   renderNow(source: HTMLCanvasElement, version: number, adjust: Adjust): boolean {
@@ -333,6 +340,7 @@ export class AdjustRenderer {
     if (midTaps) this.setTaps(this.final, midTaps, [0, 1 / mh])
     else gl.uniform1i(this.final.loc('uN'), 0)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+    this.afterRender?.(this.canvas)
     return true
   }
 

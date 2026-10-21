@@ -16,6 +16,7 @@ export default function ExportControls({
   onCopy,
   onShare,
   onDone,
+  note,
 }: {
   prefs: ExportPrefs
   /** False where the browser can't encode WebP (Safari). */
@@ -30,6 +31,8 @@ export default function ExportControls({
   onCopy: () => void
   onShare: () => void
   onDone: () => void
+  /** A caveat about the current choice, shown under the format row. */
+  note?: string
 }) {
   const lossy = prefs.format !== 'png'
   return (
@@ -67,6 +70,7 @@ export default function ExportControls({
           {size === null ? '…' : formatBytes(size)}
         </span>
       </div>
+      {note && <p className="label text-ink-faint text-center pb-1.5 sm:pb-2">{note}</p>}
       <div className="px-3 sm:px-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
         <button type="button" className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer" onClick={onDone}>
           back
