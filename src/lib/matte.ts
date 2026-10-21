@@ -39,7 +39,7 @@ export function toModelInput(rgba: Uint8ClampedArray): Float32Array {
 /** The model's MATTE_SIZE² map → white RGBA whose alpha is the cleaned,
  *  min–max normalised matte, ready for putImageData. A flat map (no
  *  contrast at all) means nothing was found: all transparent. */
-export function outputToAlpha(out: Float32Array): Uint8ClampedArray {
+export function outputToAlpha(out: Float32Array): Uint8ClampedArray<ArrayBuffer> {
   let lo = Infinity
   let hi = -Infinity
   for (const v of out) {
