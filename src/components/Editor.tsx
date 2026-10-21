@@ -388,9 +388,13 @@ export default function Editor({
   // Mirror for the keyboard handler, whose closure is only refreshed when the
   // tool changes.
   const adjustRef = useRef<Adjust>(NEUTRAL_ADJUST)
+  const imgVersionRef = useRef(0)
+  const adjustGLRef = useRef(adjustGL)
   useEffect(() => {
     adjustRef.current = adjust
-  }, [adjust])
+    imgVersionRef.current = imgVersion
+    adjustGLRef.current = adjustGL
+  }, [adjust, imgVersion, adjustGL])
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
   const { reset: resetText, removeCovered: removeCoveredText, addBack: addBackText } = textTool
@@ -671,7 +675,7 @@ export default function Editor({
       refineStroke.current = null
       const [box] = strokeRects([{ kind: 'brush', ...refine.stroke }], dims)
       const before = refine.before
-      if (box) {
+      if (box && alphaCanvasRef.current) {
         const data = before.getContext('2d', { willReadFrequently: true })!.getImageData(box.x, box.y, box.w, box.h)
         clearRedo()
         commitHistory({ kind: 'cutout-stroke', patch: { x: box.x, y: box.y, data } })
@@ -849,13 +853,16 @@ export default function Editor({
     r.setAfterRender(cutout ? (gl) => composeCut(gl) : null)
   }, [cutout, adjustGL, composeCut])
 
-  /** Re-render the cut view from whichever layer is showing the photo. */
+  /** Re-render the cut view from whichever layer is showing the photo.
+   *  Reads refs, not state: undo/redo call this from the keyboard handler,
+   *  whose closure can predate the latest adjust or pixel change. */
   const renderCutView = (dirty?: Rect) => {
-    if (!alphaCanvasRef.current || !dims) return
+    if (!alphaCanvasRef.current) return
     const r = rendererRef.current
-    if (adjustGL === 'ready' && !isNeutralAdjust(adjust) && r) {
+    const adj = adjustRef.current
+    if (adjustGLRef.current === 'ready' && !isNeutralAdjust(adj) && r) {
       // composeCut runs from the after-render hook.
-      if (r.renderNow(imgCanvasRef.current!, imgVersion, adjust)) return
+      if (r.renderNow(imgCanvasRef.current!, imgVersionRef.current, adj)) return
     }
     composeCut(imgCanvasRef.current!, dirty)
   }
@@ -903,6 +910,7 @@ export default function Editor({
       ref.current!.height = nd.h
     }
     maskStrokes.current = maskStrokes.current.map((s) => orientStroke(s, d, op))
+    parkedStrokes.current = parkedStrokes.current.map((s) => orientStroke(s, d, op))
     replayMask(nd)
     history.current = history.current.map((e) => orientEntry(e, d, op))
     textTool.applyOrient(op, d)
@@ -923,8 +931,12 @@ export default function Editor({
     track('rotate', { op })
   }
 
+  // A stroke in progress owns the planes it paints; undo waits for it.
+  const strokeActive = () =>
+    drawState.current.active || refineStroke.current !== null || mosaicStroke.current !== null
+
   const undo = () => {
-    if (busy || !dims || cropping) return
+    if (busy || !dims || cropping || strokeActive()) return
     if (maskStrokes.current.length > 0) {
       pushRedo({ kind: 'stroke', stroke: maskStrokes.current.pop()! })
       replayMask(dims)
@@ -1000,6 +1012,7 @@ export default function Editor({
       glitterCanvasRef.current!.width = c.dims.w
       glitterCanvasRef.current!.height = c.dims.h
       maskStrokes.current = []
+      parkedStrokes.current = []
       history.current = c.history
       textTool.restore(c.textItems)
       glitterTool.restore(c.glitterItems)
@@ -1019,7 +1032,7 @@ export default function Editor({
   }
 
   const redo = () => {
-    if (busy || !dims || cropping) return
+    if (busy || !dims || cropping || strokeActive()) return
     const r = redoStack.current.pop()
     if (!r) return
     setRedoLen(redoStack.current.length)
@@ -1492,6 +1505,8 @@ export default function Editor({
     glitterCanvasRef.current!.height = rect.h
 
     maskStrokes.current = []
+    // A mask set aside by a brush tool doesn't survive a (redone) crop.
+    parkedStrokes.current = []
     history.current = []
     textTool.applyCrop(rect)
     glitterTool.applyCrop(rect)

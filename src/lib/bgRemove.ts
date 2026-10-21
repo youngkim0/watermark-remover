@@ -17,7 +17,11 @@ export async function removeBackground(
   onProgress?: (p: BgProgress) => void
 ): Promise<{ alpha: HTMLCanvasElement; ep: 'webgpu' | 'wasm'; ms: number }> {
   await releaseModel()
-  const { session, ort, ep } = await createOrtSession(MODEL_URL, { onProgress, allowWebGPU: true })
+  // wasm only: the quantized graph is ConvInteger/DynamicQuantizeLinear
+  // throughout, which ort-web's WebGPU EP has no kernels for — it would
+  // bounce 1024² activations between GPU and CPU at every one, and its
+  // output was never verified against wasm.
+  const { session, ort, ep } = await createOrtSession(MODEL_URL, { onProgress, allowWebGPU: false })
   const scratch = document.createElement('canvas')
   scratch.width = scratch.height = MATTE_SIZE
   try {
