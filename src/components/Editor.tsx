@@ -17,6 +17,7 @@ import GlitterControls from './GlitterControls'
 import TextEditOverlay from './TextEditOverlay'
 import ZoomControls from './ZoomControls'
 import AdjustControls from './AdjustControls'
+import ExportControls from './ExportControls'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
@@ -42,6 +43,13 @@ import {
 } from '@/lib/orient'
 import { NEUTRAL_ADJUST, isNeutralAdjust, sameAdjust, type Adjust } from '@/lib/adjust'
 import { AdjustRenderer } from '@/lib/adjustRenderer'
+import {
+  canEncodeWebp,
+  formatInfo,
+  loadExportPrefs,
+  saveExportPrefs,
+  type ExportPrefs,
+} from '@/lib/exportFormat'
 
 const MAX_SIDE = 4096
 // iOS Safari rejects canvases over ~16.7M pixels (4096²); stay clear of it.
@@ -85,6 +93,7 @@ type HistoryEntry =
 // MAX_UNDO_BYTES (two full planes + copied patches); otherwise a crop is final.
 type CropUndo = {
   dims: Dims
+  rect: Rect
   image: ImageData
   orig: ImageData
   history: HistoryEntry[]
@@ -93,6 +102,18 @@ type CropUndo = {
   textItems: TextItem[]
   glitterItems: GlitterItem[]
 }
+
+// What undo took away, in the form that puts it back. Entries are only valid
+// in the exact state they were undone from, so any new edit clears the stack.
+// An erase keeps the post-erase pixels of each patch plus the ids of the
+// overlay items it swallowed; a crop keeps just its rect, since undoing it
+// restored the full pre-crop state.
+type RedoEntry =
+  | { kind: 'stroke'; stroke: MaskStroke }
+  | { kind: 'orient'; op: OrientOp }
+  | { kind: 'adjust'; prev: Adjust; next: Adjust }
+  | { kind: 'erase'; patches: InpaintPatch[]; texts: number[]; glitters: number[] }
+  | { kind: 'crop'; rect: Rect }
 
 /** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
  *  full-resolution pixel data to find the mask. Detect strokes contribute
@@ -180,8 +201,16 @@ function clusterRects(rects: Rect[], gap: number): Rect[] {
   return out
 }
 
-const entryBytes = (g: HistoryEntry) =>
+const entryBytes = (g: HistoryEntry | RedoEntry) =>
   g.kind === 'erase' ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0) : 0
+
+const isEditable = (t: EventTarget | null) => {
+  const el = t as HTMLElement | null
+  return (
+    !!el &&
+    (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.isContentEditable)
+  )
+}
 
 /** A mask stroke on a `d`-sized image, re-expressed after a rotate/flip. */
 function orientStroke(s: MaskStroke, d: Dims, op: OrientOp): MaskStroke {
@@ -216,9 +245,12 @@ function fitContain(img: Dims, box: Dims): Dims {
 export default function Editor({
   file,
   onReplace,
+  onOpen,
 }: {
   file: File
   onReplace: () => void
+  /** Swap in another image (pasted while editing). */
+  onOpen: (file: File) => void
 }) {
   const stageRef = useRef<HTMLDivElement>(null)
   const imgCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -232,6 +264,7 @@ export default function Editor({
   const drawState = useRef({ active: false, x: 0, y: 0 })
   const maskStrokes = useRef<MaskStroke[]>([])
   const history = useRef<HistoryEntry[]>([])
+  const redoStack = useRef<RedoEntry[]>([])
   const busyRef = useRef(false)
   const rendererRef = useRef<AdjustRenderer | null>(null)
   // Slider values when the adjust panel opened, for its single undo entry.
@@ -252,8 +285,16 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
-  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust'>('erase')
+  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'export'>('erase')
   const [historyLen, setHistoryLen] = useState(0)
+  const [redoLen, setRedoLen] = useState(0)
+  const [exportPrefs, setExportPrefs] = useState<ExportPrefs>(loadExportPrefs)
+  // The encoded image for the current export choice, rendered ahead of the
+  // click: Safari only lets share/clipboard run straight off a user gesture,
+  // so they can't wait on an encode.
+  const [exportBlob, setExportBlob] = useState<{ blob: Blob; key: string } | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [pendingPaste, setPendingPaste] = useState<File | null>(null)
   const [orientation, setOrientation] = useState<Orientation>(IDENTITY_ORIENTATION)
   const [adjust, setAdjust] = useState<Adjust>(NEUTRAL_ADJUST)
   // Bumped whenever the working pixels change, so the adjust layer knows to
@@ -264,6 +305,13 @@ export default function Editor({
   const cropRectRef = useRef<Rect>({ x: 0, y: 0, w: 0, h: 0 })
   const cropUndo = useRef<CropUndo | null>(null)
   const [originalDims, setOriginalDims] = useState<Dims | null>(null)
+
+  // Mirror for the keyboard handler, whose closure is only refreshed when the
+  // tool changes.
+  const adjustRef = useRef<Adjust>(NEUTRAL_ADJUST)
+  useEffect(() => {
+    adjustRef.current = adjust
+  }, [adjust])
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
   const { reset: resetText, removeCovered: removeCoveredText, addBack: addBackText } = textTool
@@ -329,6 +377,7 @@ export default function Editor({
         bmp.close()
         maskStrokes.current = []
         history.current = []
+        redoStack.current = []
         cropUndo.current = null
         resetText()
         resetGlitter()
@@ -340,6 +389,7 @@ export default function Editor({
         setMaskActions(0)
         setEraseCount(0)
         setHistoryLen(0)
+        setRedoLen(0)
         setOrientation(IDENTITY_ORIENTATION)
         setAdjust(NEUTRAL_ADJUST)
         setImgVersion((v) => v + 1)
@@ -376,6 +426,24 @@ export default function Editor({
   }, [dims])
 
   const displayScale = dims && fit.w ? dims.w / fit.w : 1
+
+  const clearRedo = () => {
+    redoStack.current = []
+    setRedoLen(0)
+  }
+
+  /** Push an undone step for redo, keeping undo + redo pixel data together
+   *  under the shared cap by dropping the oldest redo steps first. */
+  const pushRedo = (r: RedoEntry) => {
+    redoStack.current.push(r)
+    let bytes =
+      history.current.reduce((n, g) => n + entryBytes(g), 0) +
+      redoStack.current.reduce((n, g) => n + entryBytes(g), 0)
+    while (bytes > MAX_UNDO_BYTES && redoStack.current.length > 1) {
+      bytes -= entryBytes(redoStack.current.shift()!)
+    }
+    setRedoLen(redoStack.current.length)
+  }
 
   const maskCtx = () => maskCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
 
@@ -424,6 +492,7 @@ export default function Editor({
       return
     }
     e.currentTarget.setPointerCapture(e.pointerId)
+    clearRedo()
     setDetectResult(null)
     setMaskActions((n) => n + 1)
     const rect = maskCanvasRef.current!.getBoundingClientRect()
@@ -518,6 +587,7 @@ export default function Editor({
     if (marks.length === 0) return 0
     if (!imgCanvasRef.current) return 0
     maskStrokes.current.push({ kind: 'detect', rects: marks.map((m) => m.rect) })
+    clearRedo()
     setMaskActions((n) => n + 1)
     paintDetect(marks.map((m) => m.rect))
     return marks.length
@@ -611,6 +681,7 @@ export default function Editor({
 
   const orient = (op: OrientOp) => {
     if (busy || !dims || cropping) return
+    clearRedo()
     applyOrient(op, true)
     track('rotate', { op })
   }
@@ -618,7 +689,7 @@ export default function Editor({
   const undo = () => {
     if (busy || !dims || cropping) return
     if (maskStrokes.current.length > 0) {
-      maskStrokes.current.pop()
+      pushRedo({ kind: 'stroke', stroke: maskStrokes.current.pop()! })
       replayMask(dims)
       setMaskActions((n) => Math.max(0, n - 1))
       setDetectResult(null)
@@ -629,11 +700,25 @@ export default function Editor({
     if (prev) {
       setHistoryLen(history.current.length)
       if (prev.kind === 'orient') {
+        pushRedo({ kind: 'orient', op: prev.op })
         applyOrient(inverseOrient(prev.op), false)
       } else if (prev.kind === 'adjust') {
+        pushRedo({ kind: 'adjust', prev: prev.prev, next: adjustRef.current })
         setAdjust(prev.prev)
       } else {
-        const ctx = imgCanvasRef.current!.getContext('2d')!
+        const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+        // Read every patch's post-erase pixels before restoring any, so
+        // overlapping patches all capture the final state.
+        pushRedo({
+          kind: 'erase',
+          patches: prev.patches.map((p) => ({
+            x: p.x,
+            y: p.y,
+            data: ctx.getImageData(p.x, p.y, p.data.width, p.data.height),
+          })),
+          texts: prev.texts.map((t) => t.id),
+          glitters: prev.glitters.map((g) => g.id),
+        })
         for (let i = prev.patches.length - 1; i >= 0; i--) {
           ctx.putImageData(prev.patches[i].data, prev.patches[i].x, prev.patches[i].y)
         }
@@ -647,6 +732,7 @@ export default function Editor({
     }
     const c = cropUndo.current
     if (c) {
+      pushRedo({ kind: 'crop', rect: c.rect })
       for (const [canvas, snap] of [
         [imgCanvasRef.current!, c.image],
         [origCanvasRef.current!, c.orig],
@@ -677,8 +763,49 @@ export default function Editor({
     }
   }
 
+  const redo = () => {
+    if (busy || !dims || cropping) return
+    const r = redoStack.current.pop()
+    if (!r) return
+    setRedoLen(redoStack.current.length)
+    if (r.kind === 'stroke') {
+      maskStrokes.current.push(r.stroke)
+      replayMask(dims)
+      setMaskActions((n) => n + 1)
+      setDetectResult(null)
+    } else if (r.kind === 'orient') {
+      applyOrient(r.op, true)
+    } else if (r.kind === 'adjust') {
+      history.current.push({ kind: 'adjust', prev: r.prev })
+      setHistoryLen(history.current.length)
+      setAdjust(r.next)
+    } else if (r.kind === 'erase') {
+      const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+      const prior = r.patches.map((p) => ({
+        x: p.x,
+        y: p.y,
+        data: ctx.getImageData(p.x, p.y, p.data.width, p.data.height),
+      }))
+      for (const p of r.patches) ctx.putImageData(p.data, p.x, p.y)
+      history.current.push({
+        kind: 'erase',
+        patches: prior,
+        texts: textTool.removeIds(r.texts),
+        glitters: glitterTool.removeIds(r.glitters),
+      })
+      setHistoryLen(history.current.length)
+      setEraseCount((n) => n + 1)
+      setImgVersion((v) => v + 1)
+    } else {
+      cropTo(r.rect)
+    }
+    track('redo')
+  }
+
   const clearMask = useCallback(() => {
     if (busy || !dims) return
+    redoStack.current = []
+    setRedoLen(0)
     maskCtx().clearRect(0, 0, dims.w, dims.h)
     maskStrokes.current = []
     setMaskActions(0)
@@ -765,6 +892,8 @@ export default function Editor({
       if (patches.length > 0 || removedTexts.length > 0 || removedGlitters.length > 0) {
         history.current.push({ kind: 'erase', patches, texts: removedTexts, glitters: removedGlitters })
         committed = true
+        redoStack.current = []
+        setRedoLen(0)
         let bytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
         while (
           history.current.length > MAX_UNDO ||
@@ -883,6 +1012,7 @@ export default function Editor({
   const exitAdjust = () => {
     // One undo step for the whole visit, however many slider moves it took.
     if (!sameAdjust(adjust, adjustAtOpen.current)) {
+      clearRedo()
       history.current.push({ kind: 'adjust', prev: adjustAtOpen.current })
       if (history.current.length > MAX_UNDO) history.current.shift()
       setHistoryLen(history.current.length)
@@ -910,7 +1040,15 @@ export default function Editor({
       setCropping(false)
       return
     }
+    clearRedo()
+    cropTo(rect)
+    track('crop', { w: rect.w, h: rect.h })
+  }
 
+  /** Crop every plane to `rect` (natural px), keeping a single-level undo
+   *  snapshot when it fits. Shared by apply and redo. */
+  const cropTo = (rect: Rect) => {
+    if (!dims) return
     const imgCanvas = imgCanvasRef.current!
     const origCanvas = origCanvasRef.current!
     const maskCanvas = maskCanvasRef.current!
@@ -926,6 +1064,7 @@ export default function Editor({
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
         dims: { w: dims.w, h: dims.h },
+        rect: { ...rect },
         image: imgCtx.getImageData(0, 0, dims.w, dims.h),
         orig: origCtx.getImageData(0, 0, dims.w, dims.h),
         history: history.current.slice(),
@@ -973,30 +1112,28 @@ export default function Editor({
     setImgVersion((v) => v + 1)
     setDims({ w: rect.w, h: rect.h })
     setCropping(false)
-    track('crop', { w: rect.w, h: rect.h })
   }
 
-  const download = async () => {
-    track('download', {
-      erases: eraseCount,
-      texts: textTool.items.length,
-      glitters: glitterTool.items.length,
-    })
-    const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
-      b.toString(16).padStart(2, '0')
-    ).join('')
+  /** Encode the finished image: the working pixels with the adjust layer
+   *  and the overlays composited in (they never touch the working canvas,
+   *  so they stay editable after saving). */
+  const renderExport = async (prefs: ExportPrefs): Promise<Blob | null> => {
+    const { mime } = formatInfo(prefs.format)
     let source: HTMLCanvasElement = imgCanvasRef.current!
     const adjusted = !isNeutralAdjust(adjust)
-    if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted) {
-      // Composite the overlays into the export (they never touch the working
-      // canvas, so they stay editable after saving). Sparkles draw last so
-      // they sit on top of a caption, matching the on-screen layering.
+    const opaque = prefs.format === 'jpeg'
+    if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted || opaque) {
       await loadFontsFor(textTool.items)
       await loadPlatesFor(glitterTool.items)
       const scratch = document.createElement('canvas')
       scratch.width = source.width
       scratch.height = source.height
       const ctx = scratch.getContext('2d')!
+      // JPEG has no alpha: transparent pixels would encode as black.
+      if (opaque) {
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, scratch.width, scratch.height)
+      }
       // The adjusted photo comes off the GL canvas, which is only readable in
       // the same task it was drawn in — render and copy with no await between.
       const r = rendererRef.current
@@ -1006,37 +1143,149 @@ export default function Editor({
         if (adjusted) setError('Adjustments could not be applied — saved without them.')
         ctx.drawImage(source, 0, 0)
       }
+      // Sparkles draw last so they sit on top of a caption, matching the
+      // on-screen layering.
       drawTextItems(ctx, textTool.items)
       drawGlitterItems(ctx, glitterTool.items)
       source = scratch
     }
-    source.toBlob((blob) => {
-      // Drop a composited scratch plane now rather than at GC: on WebKit it
-      // lives in the GPU process, and repeated saves stacked ~100MB each.
-      if (source !== imgCanvasRef.current) {
-        source.width = 0
-        source.height = 0
-      }
-      if (!blob) return
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `Unmark_${token}.png`
-      a.click()
-      URL.revokeObjectURL(url)
-    }, 'image/png')
+    return new Promise((resolve) => {
+      source.toBlob(
+        (blob) => {
+          // Drop a composited scratch plane now rather than at GC: on WebKit it
+          // lives in the GPU process, and repeated saves stacked ~100MB each.
+          if (source !== imgCanvasRef.current) {
+            source.width = 0
+            source.height = 0
+          }
+          resolve(blob)
+        },
+        mime,
+        prefs.format === 'png' ? undefined : prefs.quality / 100
+      )
+    })
   }
 
-  // Keyboard: [ ] brush size, cmd/ctrl+z undo, hold c to compare.
+  const exportKey = `${exportPrefs.format}:${exportPrefs.quality}`
+  const exportReady = exportBlob !== null && exportBlob.key === exportKey
+
+  // Pre-encode while the save panel is open. Pixels and overlays can't change
+  // in here, so only the format/quality choice re-renders (debounced, since
+  // the quality slider fires on every step).
+  useEffect(() => {
+    if (tool !== 'export') return
+    let alive = true
+    const t = setTimeout(async () => {
+      const blob = await renderExport(exportPrefs)
+      if (!alive) return
+      if (blob) setExportBlob({ blob, key: `${exportPrefs.format}:${exportPrefs.quality}` })
+      else setError('Could not encode the image.')
+    }, 150)
+    return () => {
+      alive = false
+      clearTimeout(t)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool, exportPrefs])
+
+  // A transient confirmation ("copied") in the status line.
+  useEffect(() => {
+    if (!notice) return
+    const t = setTimeout(() => setNotice(null), 2500)
+    return () => clearTimeout(t)
+  }, [notice])
+
+  const exportFile = () => {
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) =>
+      b.toString(16).padStart(2, '0')
+    ).join('')
+    const { mime, ext } = formatInfo(exportPrefs.format)
+    return new File([exportBlob!.blob], `Unmark_${token}.${ext}`, { type: mime })
+  }
+
+  const exportStats = () => ({
+    format: exportPrefs.format,
+    quality: exportPrefs.format === 'png' ? 100 : exportPrefs.quality,
+    erases: eraseCount,
+    texts: textTool.items.length,
+    glitters: glitterTool.items.length,
+  })
+
+  const download = () => {
+    if (!exportReady) return
+    track('download', exportStats())
+    saveExportPrefs(exportPrefs)
+    const f = exportFile()
+    const url = URL.createObjectURL(f)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = f.name
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const canCopy =
+    typeof window !== 'undefined' && 'ClipboardItem' in window && !!navigator.clipboard?.write
+
+  const copy = () => {
+    // Clipboards only reliably take PNG. The item is built synchronously in
+    // the click with a promise for the data, which is what Safari requires.
+    const png =
+      exportReady && exportPrefs.format === 'png'
+        ? Promise.resolve(exportBlob!.blob)
+        : renderExport({ format: 'png', quality: 100 }).then((b) => {
+            if (!b) throw new Error('encode failed')
+            return b
+          })
+    navigator.clipboard
+      .write([new ClipboardItem({ 'image/png': png })])
+      .then(() => {
+        setError(null)
+        setNotice('copied to clipboard — paste it anywhere')
+        track('copy', exportStats())
+      })
+      .catch(() => setError('Copy was blocked by the browser — use download instead.'))
+  }
+
+  const canShare = (() => {
+    if (typeof navigator === 'undefined' || !navigator.canShare) return false
+    const { mime, ext } = formatInfo(exportPrefs.format)
+    try {
+      return navigator.canShare({ files: [new File([''], `x.${ext}`, { type: mime })] })
+    } catch {
+      return false
+    }
+  })()
+
+  const share = () => {
+    if (!exportReady) return
+    saveExportPrefs(exportPrefs)
+    navigator
+      .share({ files: [exportFile()] })
+      .then(() => track('share', exportStats()))
+      .catch((err: unknown) => {
+        // Closing the share sheet rejects with AbortError — not a failure.
+        if ((err as Error)?.name !== 'AbortError') setError('Sharing failed — use download instead.')
+      })
+  }
+
+  const enterExport = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    setError(null)
+    if (exportPrefs.format === 'webp' && !canEncodeWebp()) {
+      setExportPrefs((p) => ({ ...p, format: 'png' }))
+    }
+    setTool('export')
+    track('export-open')
+  }
+
+  // Keyboard: [ ] brush size, cmd/ctrl+z undo, cmd/ctrl+shift+z or ctrl+y
+  // redo, hold c to compare.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       // Never hijack keys while the user is typing (text-tool inputs).
-      const t = e.target as HTMLElement | null
-      if (
-        t &&
-        (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.isContentEditable)
-      )
-        return
+      if (isEditable(e.target)) return
       if (tool === 'glitter') {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
           e.preventDefault()
@@ -1047,7 +1296,12 @@ export default function Editor({
       if (tool !== 'erase') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+      const mod = e.metaKey || e.ctrlKey
+      const key = e.key.toLowerCase()
+      if (mod && ((key === 'z' && e.shiftKey) || (key === 'y' && !e.metaKey))) {
+        e.preventDefault()
+        redo()
+      } else if (mod && key === 'z') {
         e.preventDefault()
         undo()
       }
@@ -1078,10 +1332,29 @@ export default function Editor({
       originalDims !== null &&
       (dims.w !== originalDims.w || dims.h !== originalDims.h))
 
+  // Paste while editing: open the pasted image straight away when there's
+  // nothing to lose, otherwise ask first.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (isEditable(e.target) || busyRef.current) return
+      const item = Array.from(e.clipboardData?.items ?? []).find((i) => i.type.startsWith('image/'))
+      const f = item?.getAsFile()
+      if (!f) return
+      e.preventDefault()
+      track('image-selected', { method: 'paste-editor', type: f.type, size_kb: Math.round(f.size / 1024) })
+      if (hasEdit) setPendingPaste(f)
+      else onOpen(f)
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [hasEdit, onOpen])
+
   const adjustLayerVisible = adjustGL === 'ready' && !isNeutralAdjust(adjust)
 
   const status = cropping
     ? 'drag to select the area to keep'
+    : tool === 'export'
+    ? 'choose a format — then download, copy or share'
     : tool === 'adjust'
     ? adjustGL === 'ready'
       ? 'rotate, flip, or slide to adjust'
@@ -1281,12 +1554,31 @@ export default function Editor({
                 : 'var(--ink-faint)',
           }}
         >
-          {error ?? status}
+          {error ?? notice ?? status}
         </span>
       </div>
 
       {/* toolbar */}
-      {cropping ? (
+      {pendingPaste ? (
+        <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
+          <span className="label text-ink-dim px-2">replace this image with the pasted one?</span>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={() => setPendingPaste(null)}
+          >
+            keep editing
+          </button>
+          <button
+            type="button"
+            onClick={() => onOpen(pendingPaste)}
+            className="label px-6 sm:px-7 h-9 sm:h-10 cursor-pointer"
+            style={{ background: 'var(--amber)', color: '#181612', fontWeight: 500 }}
+          >
+            replace
+          </button>
+        </div>
+      ) : cropping ? (
         <div className="px-3 sm:px-6 pb-3 sm:pb-6 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2">
           <button
             type="button"
@@ -1322,6 +1614,20 @@ export default function Editor({
           onOrient={orient}
           onReset={() => setAdjust(NEUTRAL_ADJUST)}
           onDone={exitAdjust}
+        />
+      ) : tool === 'export' ? (
+        <ExportControls
+          prefs={exportPrefs}
+          webp={canEncodeWebp()}
+          size={exportReady ? exportBlob!.blob.size : null}
+          ready={exportReady}
+          canCopy={canCopy}
+          canShare={canShare}
+          onPrefs={(patch) => setExportPrefs((p) => ({ ...p, ...patch }))}
+          onDownload={download}
+          onCopy={copy}
+          onShare={share}
+          onDone={() => setTool('erase')}
         />
       ) : tool === 'glitter' ? (
         <GlitterControls
@@ -1395,6 +1701,14 @@ export default function Editor({
           <button
             type="button"
             className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={redo}
+            disabled={busy || redoLen === 0}
+          >
+            redo
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
             onClick={clearMask}
             disabled={busy || maskActions === 0}
           >
@@ -1431,10 +1745,10 @@ export default function Editor({
           <button
             type="button"
             className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
-            onClick={download}
+            onClick={enterExport}
             disabled={busy || !hasEdit}
           >
-            save png
+            save
           </button>
           <button
             type="button"

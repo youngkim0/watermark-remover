@@ -203,6 +203,18 @@ export function useTextTool({
     return removed
   }, [])
 
+  /** Take out the items with these ids (redo of an erase) and return them
+   *  as they are now, so a following undo puts back the current versions. */
+  const removeIds = useCallback((ids: number[]) => {
+    const removed = itemsRef.current.filter((it) => ids.includes(it.id))
+    if (removed.length > 0) {
+      setItems((list) => list.filter((it) => !ids.includes(it.id)))
+      setSelectedId(null)
+      setEditingId(null)
+    }
+    return removed
+  }, [])
+
   /** Re-add items removed by an erase (undo). */
   const addBack = useCallback((restore: TextItem[]) => {
     if (restore.length > 0) setItems((list) => [...list, ...restore])
@@ -267,6 +279,7 @@ export function useTextTool({
     startEditing,
     commitEditing,
     removeCovered,
+    removeIds,
     addBack,
     updateSelected,
     deleteSelected,
