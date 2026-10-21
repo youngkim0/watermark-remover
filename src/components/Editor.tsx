@@ -21,7 +21,7 @@ import ExportControls from './ExportControls'
 import MosaicControls from './MosaicControls'
 import BgControls, { bgCss, type BgFill } from './BgControls'
 import { removeBackground, type BgProgress } from '@/lib/bgRemove'
-import type { AlphaPlane } from '@/lib/matte'
+import { orientPlane, type AlphaPlane } from '@/lib/matte'
 import { applyMosaic, mosaicBlock, type BrushStroke } from '@/lib/mosaic'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
@@ -95,6 +95,7 @@ type HistoryEntry =
   | { kind: 'mosaic'; patch: InpaintPatch }
   | { kind: 'cutout-on' }
   | { kind: 'cutout-off'; alpha: AlphaPlane }
+  | { kind: 'cutout-stroke'; patch: InpaintPatch }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // history that was valid against them. Kept only when it fits under
@@ -109,6 +110,8 @@ type CropUndo = {
   orientation: Orientation
   textItems: TextItem[]
   glitterItems: GlitterItem[]
+  /** The cutout's alpha before the crop, when one existed. */
+  alpha: AlphaPlane | null
 }
 
 // What undo took away, in the form that puts it back. Entries are only valid
@@ -124,6 +127,7 @@ type RedoEntry =
   | { kind: 'mosaic'; patch: InpaintPatch }
   | { kind: 'cutout-on'; alpha: AlphaPlane }
   | { kind: 'cutout-off' }
+  | { kind: 'cutout-stroke'; patch: InpaintPatch }
   | { kind: 'crop'; rect: Rect }
 
 /** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
@@ -215,7 +219,7 @@ function clusterRects(rects: Rect[], gap: number): Rect[] {
 const entryBytes = (g: HistoryEntry | RedoEntry) =>
   g.kind === 'erase'
     ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0)
-    : g.kind === 'mosaic'
+    : g.kind === 'mosaic' || g.kind === 'cutout-stroke'
       ? g.patch.data.data.byteLength
       : 'alpha' in g
         ? g.alpha.data.byteLength
@@ -275,7 +279,10 @@ function orientPatch(p: InpaintPatch, d: Dims, op: OrientOp): InpaintPatch {
 }
 
 function orientEntry(e: HistoryEntry, d: Dims, op: OrientOp): HistoryEntry {
-  if (e.kind === 'mosaic') return { kind: 'mosaic', patch: orientPatch(e.patch, d, op) }
+  if (e.kind === 'mosaic' || e.kind === 'cutout-stroke') {
+    return { kind: e.kind, patch: orientPatch(e.patch, d, op) }
+  }
+  if (e.kind === 'cutout-off') return { kind: 'cutout-off', alpha: orientPlane(e.alpha, op) }
   if (e.kind !== 'erase') return e
   const move = <T extends { x: number; y: number }>(it: T): T => ({
     ...it,
@@ -320,6 +327,10 @@ export default function Editor({
   // The mosaic stroke being drawn; it applies on release.
   const mosaicStroke = useRef<BrushStroke | null>(null)
   const alphaCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  // The refine stroke being drawn, plus a copy of the alpha from before it
+  // (held only for the stroke) to cut its undo patch from on release.
+  const refineStroke = useRef<{ stroke: BrushStroke; before: HTMLCanvasElement } | null>(null)
+  const refineCount = useRef(0)
   const cutCanvasRef = useRef<HTMLCanvasElement>(null)
   // Erase-mask strokes set aside while the mosaic tool is open, so its undo
   // reaches the mosaic steps rather than the pending mask first.
@@ -546,6 +557,32 @@ export default function Editor({
     ctx.stroke()
   }
 
+  /** One refine-brush segment straight onto the alpha: keep paints it
+   *  opaque, remove cuts it away; canvas antialiasing gives the soft edge. */
+  const paintRefine = (x0: number, y0: number, x1: number, y1: number, width: number) => {
+    const a = alphaCanvasRef.current
+    if (!a) return
+    const ctx = a.getContext('2d')!
+    ctx.save()
+    ctx.globalCompositeOperation = bgMode === 'keep' ? 'source-over' : 'destination-out'
+    ctx.strokeStyle = ctx.fillStyle = '#ffffff'
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.lineWidth = width
+    ctx.beginPath()
+    ctx.moveTo(x0, y0)
+    ctx.lineTo(x1 + (x0 === x1 && y0 === y1 ? 0.01 : 0), y1)
+    ctx.stroke()
+    ctx.restore()
+    const r = width / 2 + 2
+    renderCutView({
+      x: Math.floor(Math.min(x0, x1) - r),
+      y: Math.floor(Math.min(y0, y1) - r),
+      w: Math.ceil(Math.abs(x1 - x0) + 2 * r),
+      h: Math.ceil(Math.abs(y1 - y0) + 2 * r),
+    })
+  }
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (view.onPointerDown(e)) return // pinch / space-pan consumed the event
     if (busy || !dims || cropping) return
@@ -568,7 +605,18 @@ export default function Editor({
     // Screen→natural ratio from the live (already-scaled) rect, so the brush
     // paints a finer natural footprint when zoomed in.
     const width = brush * (rect.width ? dims.w / rect.width : displayScale)
-    if (tool === 'mosaic') {
+    if (tool === 'bg') {
+      const a = alphaCanvasRef.current
+      if (!cutout || !a) return
+      const before = document.createElement('canvas')
+      before.width = a.width
+      before.height = a.height
+      before.getContext('2d')!.drawImage(a, 0, 0)
+      refineStroke.current = { stroke: { width, points: [{ x, y }] }, before }
+      drawState.current = { active: true, x, y }
+      paintRefine(x, y, x, y, width)
+      return
+    } else if (tool === 'mosaic') {
       mosaicStroke.current = { width, points: [{ x, y }] }
     } else {
       clearRedo()
@@ -598,6 +646,13 @@ export default function Editor({
     setCursor({ x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z, z })
     if (!drawState.current.active || busy || !dims) return
     const { x, y } = toNatural(e)
+    const refine = refineStroke.current
+    if (refine) {
+      refine.stroke.points.push({ x, y })
+      paintRefine(drawState.current.x, drawState.current.y, x, y, refine.stroke.width)
+      drawState.current = { active: true, x, y }
+      return
+    }
     const last = maskStrokes.current[maskStrokes.current.length - 1]
     const stroke = tool === 'mosaic' ? mosaicStroke.current : last?.kind === 'brush' ? last : null
     if (stroke) {
@@ -611,6 +666,20 @@ export default function Editor({
     textTool.onPointerUp()
     glitterTool.onPointerUp()
     drawState.current.active = false
+    const refine = refineStroke.current
+    if (refine && dims) {
+      refineStroke.current = null
+      const [box] = strokeRects([{ kind: 'brush', ...refine.stroke }], dims)
+      const before = refine.before
+      if (box) {
+        const data = before.getContext('2d', { willReadFrequently: true })!.getImageData(box.x, box.y, box.w, box.h)
+        clearRedo()
+        commitHistory({ kind: 'cutout-stroke', patch: { x: box.x, y: box.y, data } })
+        refineCount.current++
+      }
+      before.width = before.height = 0
+      return
+    }
     const m = mosaicStroke.current
     if (m && dims) {
       mosaicStroke.current = null
@@ -642,6 +711,21 @@ export default function Editor({
       if (dims) maskCtx().clearRect(0, 0, dims.w, dims.h)
       return
     }
+    const refine = refineStroke.current
+    if (refine) {
+      // Put the alpha back as it was before the stroke.
+      refineStroke.current = null
+      const a = alphaCanvasRef.current
+      if (a) {
+        const ctx = a.getContext('2d')!
+        ctx.globalCompositeOperation = 'copy'
+        ctx.drawImage(refine.before, 0, 0)
+        ctx.globalCompositeOperation = 'source-over'
+        renderCutView()
+      }
+      refine.before.width = refine.before.height = 0
+      return
+    }
     const last = maskStrokes.current[maskStrokes.current.length - 1]
     if (last?.kind === 'brush') {
       maskStrokes.current.pop()
@@ -657,7 +741,8 @@ export default function Editor({
     onPinchStart: cancelStroke,
     // Erase hides the OS cursor behind the brush-circle preview; every other
     // tool needs a visible pointer over the image.
-    baseCursor: (tool === 'erase' || tool === 'mosaic') && !cropping ? 'none' : 'default',
+    baseCursor:
+      (tool === 'erase' || tool === 'mosaic' || (tool === 'bg' && cutout)) && !cropping ? 'none' : 'default',
   })
 
   // Reset zoom/pan to fit whenever a new image is loaded.
@@ -812,6 +897,7 @@ export default function Editor({
     const nd = orientDims(d, op)
     orientCanvas(imgCanvasRef.current!, op)
     orientCanvas(origCanvasRef.current!, op)
+    if (alphaCanvasRef.current) orientCanvas(alphaCanvasRef.current, op)
     for (const ref of [maskCanvasRef, textCanvasRef, glitterCanvasRef]) {
       ref.current!.width = nd.w
       ref.current!.height = nd.h
@@ -856,6 +942,11 @@ export default function Editor({
       } else if (prev.kind === 'adjust') {
         pushRedo({ kind: 'adjust', prev: prev.prev, next: adjustRef.current })
         setAdjust(prev.prev)
+      } else if (prev.kind === 'cutout-stroke') {
+        const ctx = alphaCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+        pushRedo({ kind: 'cutout-stroke', patch: snapshotPatch(ctx, prev.patch) })
+        ctx.putImageData(prev.patch.data, prev.patch.x, prev.patch.y)
+        renderCutView()
       } else if (prev.kind === 'cutout-on') {
         pushRedo({ kind: 'cutout-on', alpha: readPlane(alphaCanvasRef.current!) })
         dropAlpha()
@@ -912,6 +1003,9 @@ export default function Editor({
       history.current = c.history
       textTool.restore(c.textItems)
       glitterTool.restore(c.glitterItems)
+      dropAlpha()
+      if (c.alpha) alphaCanvasRef.current = planeCanvas(c.alpha)
+      setCutout(c.alpha !== null)
       setMaskActions(0)
       setEraseCount(c.eraseCountBefore)
       setHistoryLen(c.history.length)
@@ -953,6 +1047,12 @@ export default function Editor({
       setHistoryLen(history.current.length)
       setEraseCount((n) => n + 1)
       setImgVersion((v) => v + 1)
+    } else if (r.kind === 'cutout-stroke') {
+      const ctx = alphaCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+      history.current.push({ kind: 'cutout-stroke', patch: snapshotPatch(ctx, r.patch) })
+      ctx.putImageData(r.patch.data, r.patch.x, r.patch.y)
+      setHistoryLen(history.current.length)
+      renderCutView()
     } else if (r.kind === 'cutout-on') {
       alphaCanvasRef.current = planeCanvas(r.alpha)
       history.current.push({ kind: 'cutout-on' })
@@ -1244,6 +1344,7 @@ export default function Editor({
     if (busy || !dims || cropping) return
     setCursor(null)
     parkMask()
+    refineCount.current = 0
     setTool('bg')
     track('bg-open')
     // One-shot: an existing cutout is refined, never re-run.
@@ -1253,6 +1354,7 @@ export default function Editor({
   const exitBg = () => {
     unparkMask()
     if (cutout) track('bg-background', { kind: bgKind(bg) })
+    if (refineCount.current > 0) track('bg-refine', { strokes: refineCount.current })
     setTool('erase')
   }
 
@@ -1336,7 +1438,8 @@ export default function Editor({
     // the current erase-undo stack fit under the shared memory cap. On large
     // images this usually won't fit, so the crop is final — matching the
     // editor's existing "don't retain full-frame pixels on mobile" policy.
-    const planeBytes = dims.w * dims.h * 4 * 2
+    const alphaNow = cutout ? alphaCanvasRef.current : null
+    const planeBytes = dims.w * dims.h * (alphaNow ? 9 : 8)
     const histBytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
@@ -1349,6 +1452,7 @@ export default function Editor({
         orientation,
         textItems: textTool.items,
         glitterItems: glitterTool.items,
+        alpha: alphaNow ? readPlane(alphaNow) : null,
       }
       setCropUndoAvailable(true)
     } else {
@@ -1371,6 +1475,14 @@ export default function Editor({
       canvas.width = rect.w
       canvas.height = rect.h
       ctx.drawImage(scratch, 0, 0)
+    }
+    if (alphaNow) {
+      const cropped = document.createElement('canvas')
+      cropped.width = rect.w
+      cropped.height = rect.h
+      cropped.getContext('2d')!.drawImage(alphaNow, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h)
+      dropAlpha()
+      alphaCanvasRef.current = cropped
     }
     maskCanvas.width = rect.w
     maskCanvas.height = rect.h
@@ -1822,7 +1934,7 @@ export default function Editor({
           })()}
           {/* brush cursor — sized in the container's local space so it stays a
               constant on-screen size after the transform scales it. */}
-          {cursor && !busy && !cropping && (tool === 'erase' || tool === 'mosaic') && (
+          {cursor && !busy && !cropping && (tool === 'erase' || tool === 'mosaic' || (tool === 'bg' && cutout)) && (
             <div
               aria-hidden
               className="absolute pointer-events-none rounded-full border"
