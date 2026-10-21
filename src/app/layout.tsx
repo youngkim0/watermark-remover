@@ -113,8 +113,11 @@ export default function RootLayout({
         {children}
         {process.env.NEXT_PUBLIC_UMAMI_WEBSITE_ID && (
           <Script
-            src="https://cloud.umami.is/script.js"
+            // Self-hosted Umami (Umami Cloud's free tier kept cutting tracking off).
+            src="https://umami.ezpzkr.com/script.js"
             data-website-id={process.env.NEXT_PUBLIC_UMAMI_WEBSITE_ID}
+            // Only count production; keeps *.vercel.app previews out of the stats.
+            data-domains="unmark.live,www.unmark.live"
             // COEP: require-corp (WASM isolation) blocks cross-origin scripts
             // unless loaded via CORS; Umami serves Access-Control-Allow-Origin: *.
             crossOrigin="anonymous"
