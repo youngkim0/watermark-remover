@@ -3,109 +3,21 @@
 // mask uint8 [1,1,H,W] where 0 marks pixels to erase (255 = keep);
 // output uint8 [1,3,H,W]. Verified empirically — the polarity is inverted
 // relative to the usual lama-cleaner convention.
-// onnxruntime-web is browser-only; load it lazily so SSR never touches it.
 import type { InferenceSession, Tensor } from 'onnxruntime-web'
 import { track } from '@/lib/analytics'
-
-type OrtModule = typeof import('onnxruntime-web/webgpu')
-
-let ortPromise: Promise<OrtModule> | null = null
-function loadOrt(): Promise<OrtModule> {
-  if (!ortPromise) {
-    // WebKit 26's wasm tier-up compiler chokes on ort's JSEP/JSPI builds:
-    // CPU pegs and memory grows ~0.7GB per run() until iOS kills the tab
-    // (onnxruntime#26827). The plain non-JSEP wasm backend is unaffected,
-    // and WebKit never uses WebGPU here anyway (see isWebKitEngine).
-    ortPromise = isWebKitEngine()
-      ? (import('onnxruntime-web') as Promise<OrtModule>)
-      : import('onnxruntime-web/webgpu')
-  }
-  return ortPromise
-}
+import { createOrtSession, loadOrt, type LoadProgress } from '@/lib/ort'
 
 const MODEL_URL = '/models/migan_pipeline_v2.onnx'
 
-export type InpaintProgress =
-  | { stage: 'download'; loaded: number; total: number }
-  | { stage: 'compile' }
-  | { stage: 'run' }
+export type InpaintProgress = LoadProgress | { stage: 'run' }
 
 type ProgressFn = (p: InpaintProgress) => void
 
 let sessionPromise: Promise<InferenceSession> | null = null
 
-// ort-web's WebGPU EP is unsupported on iOS/WebKit (onnxruntime#22776):
-// session creation can succeed and then session.run() crashes the WebKit
-// content process — the page silently reloads, so no catch ever fires.
-// All iOS browsers are WebKit, and only Chromium-likes ship "Chrome/" in
-// the UA, so gate by engine rather than by navigator.gpu presence.
-function isWebKitEngine(): boolean {
-  const ua = navigator.userAgent
-  return /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)
-}
-
-async function hasWebGPU(): Promise<boolean> {
-  if (isWebKitEngine()) return false
-  const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu
-  if (!gpu) return false
-  try {
-    return (await gpu.requestAdapter()) !== null
-  } catch {
-    return false
-  }
-}
-
-async function fetchModel(onProgress?: ProgressFn): Promise<ArrayBuffer> {
-  const res = await fetch(MODEL_URL)
-  if (!res.ok || !res.body) throw new Error(`Model download failed (${res.status})`)
-  const total = Number(res.headers.get('content-length') ?? 0)
-  const reader = res.body.getReader()
-  const chunks: Uint8Array[] = []
-  let loaded = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-    loaded += value.length
-    onProgress?.({ stage: 'download', loaded, total })
-  }
-  const buffer = new Uint8Array(loaded)
-  let offset = 0
-  for (const chunk of chunks) {
-    buffer.set(chunk, offset)
-    offset += chunk.length
-  }
-  return buffer.buffer
-}
-
 async function createSession(onProgress?: ProgressFn): Promise<InferenceSession> {
-  const ort = await loadOrt()
-  // On WebKit, pin the exact non-JSEP binary — the loader would otherwise
-  // feature-detect JSPI (WebKit 26 has it) and pick a build that triggers
-  // the tier-up compiler bug above.
-  ort.env.wasm.wasmPaths = isWebKitEngine()
-    ? {
-        wasm: '/ort/ort-wasm-simd-threaded.wasm',
-        mjs: '/ort/ort-wasm-simd-threaded.mjs',
-      }
-    : '/ort/'
-  const webgpu = await hasWebGPU()
-  if (!webgpu) {
-    ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency ?? 4, 8)
-  }
-  const buffer = await fetchModel(onProgress)
-  onProgress?.({ stage: 'compile' })
-  if (webgpu) {
-    try {
-      const session = await ort.InferenceSession.create(buffer, { executionProviders: ['webgpu'] })
-      track('model-ep', { ep: 'webgpu' })
-      return session
-    } catch {
-      // fall through to wasm
-    }
-  }
-  const session = await ort.InferenceSession.create(buffer, { executionProviders: ['wasm'] })
-  track('model-ep', { ep: 'wasm' })
+  const { session, ep } = await createOrtSession(MODEL_URL, { onProgress, allowWebGPU: true })
+  track('model-ep', { ep })
   return session
 }
 
@@ -122,6 +34,20 @@ function getSession(onProgress?: ProgressFn): Promise<InferenceSession> {
 /** Warm the model (download + compile) ahead of the first erase. */
 export function preloadModel(onProgress?: ProgressFn): Promise<unknown> {
   return getSession(onProgress)
+}
+
+/** Free the MI-GAN session so another model can run without both arenas
+ *  resident (iPhone tabs die well before two fit). The next erase or
+ *  preload re-creates it from the HTTP cache. */
+export async function releaseModel(): Promise<void> {
+  const pending = sessionPromise
+  sessionPromise = null
+  if (!pending) return
+  try {
+    await (await pending).release()
+  } catch {
+    // a session that failed to load has nothing to free
+  }
 }
 
 export type Rect = { x: number; y: number; w: number; h: number }
