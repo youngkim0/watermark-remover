@@ -32,6 +32,10 @@ export const USE_CASES: { title: string; body: string }[] = [
     title: 'Blemishes & spots',
     body: 'Dust, sensor spots and small skin blemishes disappear into the background.',
   },
+  {
+    title: 'Backgrounds',
+    body: 'Cut out a person or product in one tap — keep it transparent or drop it on white.',
+  },
 ]
 
 export const STEPS: { n: string; title: string; body: string }[] = [
@@ -90,7 +94,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: 'What image formats and sizes are supported?',
-    a: 'PNG, JPG and WebP up to 4096 pixels on the longest side. Save the result as PNG, JPG or WebP, or copy it straight to the clipboard.',
+    a: 'PNG, JPG and WebP up to 4096 pixels on the longest side. Save the result as PNG, JPG or WebP — transparent PNG after removing a background — or copy it straight to the clipboard.',
   },
   {
     q: 'Can I use it on any image?',
