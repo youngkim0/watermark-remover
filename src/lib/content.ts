@@ -48,7 +48,7 @@ export const STEPS: { n: string; title: string; body: string }[] = [
   {
     n: '03',
     title: 'Download the clean image',
-    body: 'Save a full-resolution PNG. Done in seconds, entirely on your device.',
+    body: 'Save a full-resolution PNG, JPG or WebP — or copy and share it. Done in seconds, entirely on your device.',
   },
 ]
 
@@ -90,7 +90,7 @@ export const FAQ: { q: string; a: string }[] = [
   },
   {
     q: 'What image formats and sizes are supported?',
-    a: 'PNG, JPG and WebP up to 4096 pixels on the longest side. Cleaned images are saved as PNG.',
+    a: 'PNG, JPG and WebP up to 4096 pixels on the longest side. Save the result as PNG, JPG or WebP, or copy it straight to the clipboard.',
   },
   {
     q: 'Can I use it on any image?',

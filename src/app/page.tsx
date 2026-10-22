@@ -70,7 +70,12 @@ export default function Home() {
     return (
       <main className="h-dvh flex flex-col">
         <Header onHome={closeFile} />
-        <Editor key={`${file.name}-${file.lastModified}`} file={file} onReplace={closeFile} />
+        <Editor
+          key={`${file.name}-${file.lastModified}`}
+          file={file}
+          onReplace={closeFile}
+          onOpen={setFile}
+        />
         {/* Reclaim the footer's height for the image on phones. */}
         <Footer className="hidden sm:flex" />
       </main>
