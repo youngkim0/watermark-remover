@@ -129,7 +129,13 @@ About half the users are on phones, often iPhones. The iOS/WebKit constraints in
 
 ### The cutout layer (non-destructive)
 
-- The result is an **alpha plane** at the working resolution, kept separately
+- *(Revised 2026-10-22 for memory.)* The alpha is stored at **≤2048px on
+  the long side** (the model only sees 1024², so a full-resolution alpha adds
+  cost, not detail). It is shown as a **fill overlay** at the same capped size,
+  CSS-scaled over the unchanged photo/adjust layers. No full-resolution cut-view
+  composite exists, and export scales the alpha up once. Measured in WebKit on
+  11.2MP: retained GPU-process memory fell from +168MB to +30MB.
+- The result is an **alpha plane** (originally: at the working resolution), kept separately
   from the working pixels. The working canvas keeps full RGB everywhere, so
   erase, detect, mosaic and adjust keep operating on real pixels, and the
   cutout is applied at display and export.

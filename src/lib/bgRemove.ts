@@ -8,10 +8,16 @@ import { createOrtSession, type LoadProgress } from '@/lib/ort'
 
 const MODEL_URL = '/models/isnet_general_q.onnx'
 
+// The model only ever sees 1024², so a full-resolution alpha would carry no
+// extra detail — just cost. 2048 leaves headroom for refine strokes and
+// scales up smoothly at display and export.
+export const ALPHA_MAX_SIDE = 2048
+
 export type BgProgress = LoadProgress | { stage: 'run' }
 
-/** Cut the subject out of `source`. Returns a canvas of the same size whose
- *  pixels are white and whose alpha is the cutout. */
+/** Cut the subject out of `source`. Returns a canvas with `source`'s aspect,
+ *  at most ALPHA_MAX_SIDE on its long side, whose pixels are white and whose
+ *  alpha is the cutout. */
 export async function removeBackground(
   source: HTMLCanvasElement,
   onProgress?: (p: BgProgress) => void
@@ -42,11 +48,12 @@ export async function removeBackground(
     tensor.dispose?.()
     sctx.putImageData(new ImageData(rgba, MATTE_SIZE, MATTE_SIZE), 0, 0)
     const alpha = document.createElement('canvas')
-    alpha.width = source.width
-    alpha.height = source.height
+    const k = Math.min(1, ALPHA_MAX_SIDE / Math.max(source.width, source.height))
+    alpha.width = Math.max(1, Math.round(source.width * k))
+    alpha.height = Math.max(1, Math.round(source.height * k))
     const actx = alpha.getContext('2d', { willReadFrequently: true })!
     actx.imageSmoothingQuality = 'high'
-    actx.drawImage(scratch, 0, 0, source.width, source.height)
+    actx.drawImage(scratch, 0, 0, alpha.width, alpha.height)
     return { alpha, ep, ms: Math.round(performance.now() - t0) }
   } finally {
     scratch.width = scratch.height = 0

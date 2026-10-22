@@ -331,7 +331,11 @@ export default function Editor({
   // (held only for the stroke) to cut its undo patch from on release.
   const refineStroke = useRef<{ stroke: BrushStroke; before: HTMLCanvasElement } | null>(null)
   const refineCount = useRef(0)
-  const cutCanvasRef = useRef<HTMLCanvasElement>(null)
+  // Fill drawn over the photo wherever the cutout is transparent — at the
+  // alpha's (capped) resolution and CSS-scaled, so a cutout costs two small
+  // planes instead of full-resolution composites.
+  const fillCanvasRef = useRef<HTMLCanvasElement>(null)
+  const bgRef = useRef<BgFill>({ kind: 'transparent' })
   // Erase-mask strokes set aside while the mosaic tool is open, so its undo
   // reaches the mosaic steps rather than the pending mask first.
   const parkedStrokes = useRef<MaskStroke[]>([])
@@ -358,7 +362,7 @@ export default function Editor({
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
   const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'mosaic' | 'bg' | 'export'>('erase')
   // Background removal: the cutout is an alpha canvas beside the working
-  // pixels (never baked in), shown through cutCanvas over the fill.
+  // pixels (never baked in); the fill overlay covers what it cuts away.
   const [cutout, setCutout] = useState(false)
   const [bg, setBg] = useState<BgFill>({ kind: 'transparent' })
   const [bgMode, setBgMode] = useState<'keep' | 'remove'>('keep')
@@ -388,13 +392,9 @@ export default function Editor({
   // Mirror for the keyboard handler, whose closure is only refreshed when the
   // tool changes.
   const adjustRef = useRef<Adjust>(NEUTRAL_ADJUST)
-  const imgVersionRef = useRef(0)
-  const adjustGLRef = useRef(adjustGL)
   useEffect(() => {
     adjustRef.current = adjust
-    imgVersionRef.current = imgVersion
-    adjustGLRef.current = adjustGL
-  }, [adjust, imgVersion, adjustGL])
+  }, [adjust])
 
   const textTool = useTextTool({ canvasRef: textCanvasRef, dims })
   const { reset: resetText, removeCovered: removeCoveredText, addBack: addBackText } = textTool
@@ -565,7 +565,10 @@ export default function Editor({
    *  opaque, remove cuts it away; canvas antialiasing gives the soft edge. */
   const paintRefine = (x0: number, y0: number, x1: number, y1: number, width: number) => {
     const a = alphaCanvasRef.current
-    if (!a) return
+    if (!a || !dims) return
+    // Natural → alpha-canvas pixels (the alpha is stored at capped size).
+    const k = a.width / dims.w
+    x0 *= k; y0 *= k; x1 *= k; y1 *= k; width *= k
     const ctx = a.getContext('2d')!
     ctx.save()
     ctx.globalCompositeOperation = bgMode === 'keep' ? 'source-over' : 'destination-out'
@@ -579,7 +582,7 @@ export default function Editor({
     ctx.stroke()
     ctx.restore()
     const r = width / 2 + 2
-    renderCutView({
+    renderFill({
       x: Math.floor(Math.min(x0, x1) - r),
       y: Math.floor(Math.min(y0, y1) - r),
       w: Math.ceil(Math.abs(x1 - x0) + 2 * r),
@@ -673,8 +676,12 @@ export default function Editor({
     const refine = refineStroke.current
     if (refine && dims) {
       refineStroke.current = null
-      const [box] = strokeRects([{ kind: 'brush', ...refine.stroke }], dims)
       const before = refine.before
+      const k = before.width / dims.w
+      const [box] = strokeRects(
+        [{ kind: 'brush', width: refine.stroke.width * k, points: refine.stroke.points.map((p) => ({ x: p.x * k, y: p.y * k })) }],
+        { w: before.width, h: before.height }
+      )
       if (box && alphaCanvasRef.current) {
         const data = before.getContext('2d', { willReadFrequently: true })!.getImageData(box.x, box.y, box.w, box.h)
         clearRedo()
@@ -725,7 +732,7 @@ export default function Editor({
         ctx.globalCompositeOperation = 'copy'
         ctx.drawImage(refine.before, 0, 0)
         ctx.globalCompositeOperation = 'source-over'
-        renderCutView()
+        renderFill()
       }
       refine.before.width = refine.before.height = 0
       return
@@ -819,58 +826,54 @@ export default function Editor({
     else r.draw(imgCanvasRef.current!, imgVersion, adjust)
   }, [adjust, imgVersion, dims, adjustGL])
 
-  /** Paint the visible cutout: `src` (the working pixels, or the adjust
-   *  layer while it's readable) masked by the alpha canvas. `dirty` limits
-   *  the repaint to a brush stroke's footprint. */
-  const composeCut = useCallback((src: HTMLCanvasElement, dirty?: Rect) => {
-    const cut = cutCanvasRef.current
+  /** Repaint the fill overlay: the background (colour, or a checkerboard
+   *  for transparent) everywhere the cutout's alpha isn't. `dirty` is in
+   *  alpha-canvas pixels. Reads refs: undo/redo call this from the keyboard
+   *  handler, whose closure can predate the latest background choice. */
+  const renderFill = (dirty?: Rect) => {
+    const f = fillCanvasRef.current
     const a = alphaCanvasRef.current
-    if (!cut || !a) return
-    if (cut.width !== src.width || cut.height !== src.height) {
-      cut.width = src.width
-      cut.height = src.height
+    if (!f || !a) return
+    if (f.width !== a.width || f.height !== a.height) {
+      f.width = a.width
+      f.height = a.height
       dirty = undefined
     }
-    const ctx = cut.getContext('2d')!
+    const ctx = f.getContext('2d')!
     ctx.save()
     if (dirty) {
       ctx.beginPath()
       ctx.rect(dirty.x, dirty.y, dirty.w, dirty.h)
       ctx.clip()
     }
+    const b = bgRef.current
+    if (b.kind === 'color') {
+      ctx.fillStyle = b.color
+    } else {
+      // ~5 CSS px squares at the fitted size, like the swatch's checkerboard.
+      const cell = Math.max(2, Math.round((5 * f.width) / (fit.w || f.width)))
+      const tile = document.createElement('canvas')
+      tile.width = tile.height = cell * 2
+      const t = tile.getContext('2d')!
+      t.fillStyle = '#d9d6cf'
+      t.fillRect(0, 0, cell * 2, cell * 2)
+      t.fillStyle = '#9c998f'
+      t.fillRect(cell, 0, cell, cell)
+      t.fillRect(0, cell, cell, cell)
+      ctx.fillStyle = ctx.createPattern(tile, 'repeat')!
+    }
     ctx.globalCompositeOperation = 'copy'
-    ctx.drawImage(src, 0, 0)
-    ctx.globalCompositeOperation = 'destination-in'
+    ctx.fillRect(0, 0, f.width, f.height)
+    ctx.globalCompositeOperation = 'destination-out'
     ctx.drawImage(a, 0, 0)
     ctx.restore()
-  }, [])
-
-  // While a cutout exists, every GL frame is folded into the cut view in
-  // the same task it was drawn (the GL canvas isn't readable afterwards).
-  useEffect(() => {
-    const r = rendererRef.current
-    if (!r) return
-    r.setAfterRender(cutout ? (gl) => composeCut(gl) : null)
-  }, [cutout, adjustGL, composeCut])
-
-  /** Re-render the cut view from whichever layer is showing the photo.
-   *  Reads refs, not state: undo/redo call this from the keyboard handler,
-   *  whose closure can predate the latest adjust or pixel change. */
-  const renderCutView = (dirty?: Rect) => {
-    if (!alphaCanvasRef.current) return
-    const r = rendererRef.current
-    const adj = adjustRef.current
-    if (adjustGLRef.current === 'ready' && !isNeutralAdjust(adj) && r) {
-      // composeCut runs from the after-render hook.
-      if (r.renderNow(imgCanvasRef.current!, imgVersionRef.current, adj)) return
-    }
-    composeCut(imgCanvasRef.current!, dirty)
   }
 
   useEffect(() => {
-    if (cutout) renderCutView()
+    bgRef.current = bg
+    if (cutout) renderFill()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cutout, imgVersion, dims, adjustGL, adjust])
+  }, [cutout, bg, dims, fit.w])
 
   useEffect(
     () => () => {
@@ -958,7 +961,7 @@ export default function Editor({
         const ctx = alphaCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
         pushRedo({ kind: 'cutout-stroke', patch: snapshotPatch(ctx, prev.patch) })
         ctx.putImageData(prev.patch.data, prev.patch.x, prev.patch.y)
-        renderCutView()
+        renderFill()
       } else if (prev.kind === 'cutout-on') {
         pushRedo({ kind: 'cutout-on', alpha: readPlane(alphaCanvasRef.current!) })
         dropAlpha()
@@ -1065,7 +1068,7 @@ export default function Editor({
       history.current.push({ kind: 'cutout-stroke', patch: snapshotPatch(ctx, r.patch) })
       ctx.putImageData(r.patch.data, r.patch.x, r.patch.y)
       setHistoryLen(history.current.length)
-      renderCutView()
+      renderFill()
     } else if (r.kind === 'cutout-on') {
       alphaCanvasRef.current = planeCanvas(r.alpha)
       history.current.push({ kind: 'cutout-on' })
@@ -1451,8 +1454,8 @@ export default function Editor({
     // the current erase-undo stack fit under the shared memory cap. On large
     // images this usually won't fit, so the crop is final — matching the
     // editor's existing "don't retain full-frame pixels on mobile" policy.
-    const alphaNow = cutout ? alphaCanvasRef.current : null
-    const planeBytes = dims.w * dims.h * (alphaNow ? 9 : 8)
+    const alphaNow = alphaCanvasRef.current
+    const planeBytes = dims.w * dims.h * 8 + (alphaNow ? alphaNow.width * alphaNow.height : 0)
     const histBytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
     if (planeBytes + histBytes <= MAX_UNDO_BYTES) {
       cropUndo.current = {
@@ -1490,10 +1493,14 @@ export default function Editor({
       ctx.drawImage(scratch, 0, 0)
     }
     if (alphaNow) {
+      const kx = alphaNow.width / dims.w
+      const ky = alphaNow.height / dims.h
       const cropped = document.createElement('canvas')
-      cropped.width = rect.w
-      cropped.height = rect.h
-      cropped.getContext('2d')!.drawImage(alphaNow, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h)
+      cropped.width = Math.max(1, Math.round(rect.w * kx))
+      cropped.height = Math.max(1, Math.round(rect.h * ky))
+      cropped
+        .getContext('2d')!
+        .drawImage(alphaNow, rect.x * kx, rect.y * ky, rect.w * kx, rect.h * ky, 0, 0, cropped.width, cropped.height)
       dropAlpha()
       alphaCanvasRef.current = cropped
     }
@@ -1526,7 +1533,7 @@ export default function Editor({
     let source: HTMLCanvasElement = imgCanvasRef.current!
     const adjusted = !isNeutralAdjust(adjust)
     const opaque = prefs.format === 'jpeg'
-    const alpha = cutout ? alphaCanvasRef.current : null
+    const alpha = alphaCanvasRef.current
     if (textTool.items.length > 0 || glitterTool.items.length > 0 || adjusted || opaque || alpha) {
       await loadFontsFor(textTool.items)
       await loadPlatesFor(glitterTool.items)
@@ -1534,13 +1541,6 @@ export default function Editor({
       scratch.width = source.width
       scratch.height = source.height
       const ctx = scratch.getContext('2d')!
-      // A cutout's chosen fill goes underneath; otherwise JPEG (no alpha)
-      // gets white, since transparent pixels would encode as black.
-      const fill = alpha && bg.kind === 'color' ? bg.color : opaque ? '#ffffff' : null
-      if (fill) {
-        ctx.fillStyle = fill
-        ctx.fillRect(0, 0, scratch.width, scratch.height)
-      }
       // The adjusted photo comes off the GL canvas, which is only readable in
       // the same task it was drawn in — render and copy with no await between.
       const r = rendererRef.current
@@ -1550,19 +1550,22 @@ export default function Editor({
       } else if (adjusted) {
         setError('Adjustments could not be applied — saved without them.')
       }
+      ctx.drawImage(photo, 0, 0)
       if (alpha) {
-        const cut = document.createElement('canvas')
-        cut.width = source.width
-        cut.height = source.height
-        const cctx = cut.getContext('2d')!
-        cctx.drawImage(photo, 0, 0)
-        cctx.globalCompositeOperation = 'destination-in'
-        cctx.drawImage(alpha, 0, 0)
-        ctx.drawImage(cut, 0, 0)
-        cut.width = cut.height = 0
-      } else {
-        ctx.drawImage(photo, 0, 0)
+        // The alpha is stored at capped size; scale it up smoothly.
+        ctx.globalCompositeOperation = 'destination-in'
+        ctx.imageSmoothingQuality = 'high'
+        ctx.drawImage(alpha, 0, 0, scratch.width, scratch.height)
       }
+      // A cutout's chosen fill goes underneath; otherwise JPEG (no alpha)
+      // gets white, since transparent pixels would encode as black.
+      const fill = alpha && bg.kind === 'color' ? bg.color : opaque ? '#ffffff' : null
+      if (fill) {
+        ctx.globalCompositeOperation = 'destination-over'
+        ctx.fillStyle = fill
+        ctx.fillRect(0, 0, scratch.width, scratch.height)
+      }
+      ctx.globalCompositeOperation = 'source-over'
       // Sparkles draw last so they sit on top of a caption, matching the
       // on-screen layering.
       drawTextItems(ctx, textTool.items)
@@ -1838,29 +1841,24 @@ export default function Editor({
               style={{ background: bgCss(bg), boxShadow: '0 24px 80px rgba(0,0,0,0.55)' }}
             />
           )}
-          {/* working pixels — with a cutout they only show as a faint ghost
-              while the bg tool is open, so cut-away parts can be brushed back */}
           <canvas
             ref={imgCanvasRef}
             className="absolute inset-0 w-full h-full"
-            style={{
-              boxShadow: cutout ? undefined : '0 24px 80px rgba(0,0,0,0.55)',
-              opacity: cutout ? (tool === 'bg' ? 0.25 : 0) : 1,
-            }}
+            style={{ boxShadow: cutout ? undefined : '0 24px 80px rgba(0,0,0,0.55)' }}
           />
           {/* adjusted photo (blur/sharpen/brightness) — covers the working
-              canvas only while an adjustment is set; overlays sit above it.
-              With a cutout its frames go through the cut view instead. */}
+              canvas only while an adjustment is set; overlays sit above it */}
           <canvas
             ref={adjustCanvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none"
-            style={{ visibility: adjustLayerVisible && !cutout ? 'visible' : 'hidden' }}
+            style={{ visibility: adjustLayerVisible ? 'visible' : 'hidden' }}
           />
-          {/* cutout view — the photo masked by the alpha canvas */}
+          {/* cutout fill over the cut-away parts — slightly see-through while
+              the bg tool is open, so they can be brushed back */}
           <canvas
-            ref={cutCanvasRef}
+            ref={fillCanvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none"
-            style={{ visibility: cutout ? 'visible' : 'hidden' }}
+            style={{ visibility: cutout ? 'visible' : 'hidden', opacity: tool === 'bg' ? 0.75 : 1 }}
           />
           {/* text overlay — under the compare plane so "original" hides it */}
           <canvas ref={textCanvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
