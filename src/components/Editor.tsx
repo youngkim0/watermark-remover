@@ -18,6 +18,8 @@ import TextEditOverlay from './TextEditOverlay'
 import ZoomControls from './ZoomControls'
 import AdjustControls from './AdjustControls'
 import ExportControls from './ExportControls'
+import MosaicControls from './MosaicControls'
+import { applyMosaic, mosaicBlock, type BrushStroke } from '@/lib/mosaic'
 import { useViewTransform } from '@/lib/useViewTransform'
 import { useTextTool } from '@/lib/useTextTool'
 import { drawTextItems, loadFontsFor, measureTextItem, type TextItem } from '@/lib/text'
@@ -87,6 +89,7 @@ type HistoryEntry =
   | ({ kind: 'erase' } & EraseUndo)
   | { kind: 'orient'; op: OrientOp }
   | { kind: 'adjust'; prev: Adjust }
+  | { kind: 'mosaic'; patch: InpaintPatch }
 
 // Single-level crop undo: the full pre-crop image + original planes, plus the
 // history that was valid against them. Kept only when it fits under
@@ -113,6 +116,7 @@ type RedoEntry =
   | { kind: 'orient'; op: OrientOp }
   | { kind: 'adjust'; prev: Adjust; next: Adjust }
   | { kind: 'erase'; patches: InpaintPatch[]; texts: number[]; glitters: number[] }
+  | { kind: 'mosaic'; patch: InpaintPatch }
   | { kind: 'crop'; rect: Rect }
 
 /** Per-stroke mask bounding boxes, from stroke geometry — avoids reading
@@ -202,7 +206,18 @@ function clusterRects(rects: Rect[], gap: number): Rect[] {
 }
 
 const entryBytes = (g: HistoryEntry | RedoEntry) =>
-  g.kind === 'erase' ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0) : 0
+  g.kind === 'erase'
+    ? g.patches.reduce((n, p) => n + p.data.data.byteLength, 0)
+    : g.kind === 'mosaic'
+      ? g.patch.data.data.byteLength
+      : 0
+
+/** The pixels currently under `p`'s footprint, as a patch that restores them. */
+const snapshotPatch = (ctx: CanvasRenderingContext2D, p: InpaintPatch): InpaintPatch => ({
+  x: p.x,
+  y: p.y,
+  data: ctx.getImageData(p.x, p.y, p.data.width, p.data.height),
+})
 
 const isEditable = (t: EventTarget | null) => {
   const el = t as HTMLElement | null
@@ -220,7 +235,13 @@ function orientStroke(s: MaskStroke, d: Dims, op: OrientOp): MaskStroke {
 
 /** An undo entry re-expressed after a rotate/flip, so it still lands where
  *  its pixels and overlay items now are. */
+function orientPatch(p: InpaintPatch, d: Dims, op: OrientOp): InpaintPatch {
+  const r = orientRect({ x: p.x, y: p.y, w: p.data.width, h: p.data.height }, d, op)
+  return { x: r.x, y: r.y, data: orientImageData(p.data, op) }
+}
+
 function orientEntry(e: HistoryEntry, d: Dims, op: OrientOp): HistoryEntry {
+  if (e.kind === 'mosaic') return { kind: 'mosaic', patch: orientPatch(e.patch, d, op) }
   if (e.kind !== 'erase') return e
   const move = <T extends { x: number; y: number }>(it: T): T => ({
     ...it,
@@ -228,10 +249,7 @@ function orientEntry(e: HistoryEntry, d: Dims, op: OrientOp): HistoryEntry {
   })
   return {
     kind: 'erase',
-    patches: e.patches.map((p) => {
-      const r = orientRect({ x: p.x, y: p.y, w: p.data.width, h: p.data.height }, d, op)
-      return { x: r.x, y: r.y, data: orientImageData(p.data, op) }
-    }),
+    patches: e.patches.map((p) => orientPatch(p, d, op)),
     texts: e.texts.map(move),
     glitters: e.glitters.map(move),
   }
@@ -265,6 +283,12 @@ export default function Editor({
   const maskStrokes = useRef<MaskStroke[]>([])
   const history = useRef<HistoryEntry[]>([])
   const redoStack = useRef<RedoEntry[]>([])
+  // The mosaic stroke being drawn; it applies on release.
+  const mosaicStroke = useRef<BrushStroke | null>(null)
+  // Erase-mask strokes set aside while the mosaic tool is open, so its undo
+  // reaches the mosaic steps rather than the pending mask first.
+  const parkedStrokes = useRef<MaskStroke[]>([])
+  const mosaicAtOpen = useRef(0)
   const busyRef = useRef(false)
   const rendererRef = useRef<AdjustRenderer | null>(null)
   // Slider values when the adjust panel opened, for its single undo entry.
@@ -285,7 +309,9 @@ export default function Editor({
   const [cropping, setCropping] = useState(false)
   const [detectResult, setDetectResult] = useState<'found' | 'none' | null>(null)
   const [cropUndoAvailable, setCropUndoAvailable] = useState(false)
-  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'export'>('erase')
+  const [tool, setTool] = useState<'erase' | 'text' | 'glitter' | 'adjust' | 'mosaic' | 'export'>('erase')
+  const [mosaicLevel, setMosaicLevel] = useState(5)
+  const [mosaicCount, setMosaicCount] = useState(0)
   const [historyLen, setHistoryLen] = useState(0)
   const [redoLen, setRedoLen] = useState(0)
   const [exportPrefs, setExportPrefs] = useState<ExportPrefs>(loadExportPrefs)
@@ -388,6 +414,7 @@ export default function Editor({
         setDetectResult(null)
         setMaskActions(0)
         setEraseCount(0)
+        setMosaicCount(0)
         setHistoryLen(0)
         setRedoLen(0)
         setOrientation(IDENTITY_ORIENTATION)
@@ -492,15 +519,19 @@ export default function Editor({
       return
     }
     e.currentTarget.setPointerCapture(e.pointerId)
-    clearRedo()
-    setDetectResult(null)
-    setMaskActions((n) => n + 1)
     const rect = maskCanvasRef.current!.getBoundingClientRect()
     const { x, y } = toNatural(e)
     // Screen→natural ratio from the live (already-scaled) rect, so the brush
     // paints a finer natural footprint when zoomed in.
     const width = brush * (rect.width ? dims.w / rect.width : displayScale)
-    maskStrokes.current.push({ kind: 'brush', width, points: [{ x, y }] })
+    if (tool === 'mosaic') {
+      mosaicStroke.current = { width, points: [{ x, y }] }
+    } else {
+      clearRedo()
+      setDetectResult(null)
+      setMaskActions((n) => n + 1)
+      maskStrokes.current.push({ kind: 'brush', width, points: [{ x, y }] })
+    }
     drawState.current = { active: true, x, y }
     paintDot(x, y, width)
   }
@@ -523,8 +554,9 @@ export default function Editor({
     setCursor({ x: (e.clientX - rect.left) / z, y: (e.clientY - rect.top) / z, z })
     if (!drawState.current.active || busy || !dims) return
     const { x, y } = toNatural(e)
-    const stroke = maskStrokes.current[maskStrokes.current.length - 1]
-    if (stroke?.kind === 'brush') {
+    const last = maskStrokes.current[maskStrokes.current.length - 1]
+    const stroke = tool === 'mosaic' ? mosaicStroke.current : last?.kind === 'brush' ? last : null
+    if (stroke) {
       stroke.points.push({ x, y })
       paintSegment(drawState.current.x, drawState.current.y, x, y, stroke.width)
     }
@@ -535,12 +567,37 @@ export default function Editor({
     textTool.onPointerUp()
     glitterTool.onPointerUp()
     drawState.current.active = false
+    const m = mosaicStroke.current
+    if (m && dims) {
+      mosaicStroke.current = null
+      maskCtx().clearRect(0, 0, dims.w, dims.h)
+      const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+      const patch = applyMosaic(ctx, m, mosaicBlock(mosaicLevel, dims), dims)
+      if (!patch) return
+      clearRedo()
+      history.current.push({ kind: 'mosaic', patch })
+      let bytes = history.current.reduce((n, g) => n + entryBytes(g), 0)
+      while (
+        history.current.length > MAX_UNDO ||
+        (bytes > MAX_UNDO_BYTES && history.current.length > 1)
+      ) {
+        bytes -= entryBytes(history.current.shift()!)
+      }
+      setHistoryLen(history.current.length)
+      setMosaicCount((n) => n + 1)
+      setImgVersion((v) => v + 1)
+    }
   }
 
   // Drop the in-progress brush stroke (used when a pinch starts mid-stroke).
   const cancelStroke = () => {
     if (!drawState.current.active) return
     drawState.current.active = false
+    if (mosaicStroke.current) {
+      mosaicStroke.current = null
+      if (dims) maskCtx().clearRect(0, 0, dims.w, dims.h)
+      return
+    }
     const last = maskStrokes.current[maskStrokes.current.length - 1]
     if (last?.kind === 'brush') {
       maskStrokes.current.pop()
@@ -556,7 +613,7 @@ export default function Editor({
     onPinchStart: cancelStroke,
     // Erase hides the OS cursor behind the brush-circle preview; every other
     // tool needs a visible pointer over the image.
-    baseCursor: tool === 'erase' && !cropping ? 'none' : 'default',
+    baseCursor: (tool === 'erase' || tool === 'mosaic') && !cropping ? 'none' : 'default',
   })
 
   // Reset zoom/pan to fit whenever a new image is loaded.
@@ -705,17 +762,19 @@ export default function Editor({
       } else if (prev.kind === 'adjust') {
         pushRedo({ kind: 'adjust', prev: prev.prev, next: adjustRef.current })
         setAdjust(prev.prev)
+      } else if (prev.kind === 'mosaic') {
+        const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+        pushRedo({ kind: 'mosaic', patch: snapshotPatch(ctx, prev.patch) })
+        ctx.putImageData(prev.patch.data, prev.patch.x, prev.patch.y)
+        setMosaicCount((n) => Math.max(0, n - 1))
+        setImgVersion((v) => v + 1)
       } else {
         const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
         // Read every patch's post-erase pixels before restoring any, so
         // overlapping patches all capture the final state.
         pushRedo({
           kind: 'erase',
-          patches: prev.patches.map((p) => ({
-            x: p.x,
-            y: p.y,
-            data: ctx.getImageData(p.x, p.y, p.data.width, p.data.height),
-          })),
+          patches: prev.patches.map((p) => snapshotPatch(ctx, p)),
           texts: prev.texts.map((t) => t.id),
           glitters: prev.glitters.map((g) => g.id),
         })
@@ -781,11 +840,7 @@ export default function Editor({
       setAdjust(r.next)
     } else if (r.kind === 'erase') {
       const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
-      const prior = r.patches.map((p) => ({
-        x: p.x,
-        y: p.y,
-        data: ctx.getImageData(p.x, p.y, p.data.width, p.data.height),
-      }))
+      const prior = r.patches.map((p) => snapshotPatch(ctx, p))
       for (const p of r.patches) ctx.putImageData(p.data, p.x, p.y)
       history.current.push({
         kind: 'erase',
@@ -795,6 +850,13 @@ export default function Editor({
       })
       setHistoryLen(history.current.length)
       setEraseCount((n) => n + 1)
+      setImgVersion((v) => v + 1)
+    } else if (r.kind === 'mosaic') {
+      const ctx = imgCanvasRef.current!.getContext('2d', { willReadFrequently: true })!
+      history.current.push({ kind: 'mosaic', patch: snapshotPatch(ctx, r.patch) })
+      ctx.putImageData(r.patch.data, r.patch.x, r.patch.y)
+      setHistoryLen(history.current.length)
+      setMosaicCount((n) => n + 1)
       setImgVersion((v) => v + 1)
     } else {
       cropTo(r.rect)
@@ -985,6 +1047,34 @@ export default function Editor({
 
   const exitGlitter = () => {
     glitterTool.deselect()
+    setTool('erase')
+  }
+
+  const enterMosaic = () => {
+    if (busy || !dims || cropping) return
+    setCursor(null)
+    if (maskStrokes.current.length > 0) {
+      // Redo steps may sit on top of the parked strokes; they'd replay
+      // against the wrong mask, so they go.
+      parkedStrokes.current = maskStrokes.current
+      maskStrokes.current = []
+      maskCtx().clearRect(0, 0, dims.w, dims.h)
+      clearRedo()
+    }
+    mosaicAtOpen.current = mosaicCount
+    setTool('mosaic')
+    track('mosaic-open')
+  }
+
+  const exitMosaic = () => {
+    if (dims && parkedStrokes.current.length > 0) {
+      maskStrokes.current = parkedStrokes.current
+      parkedStrokes.current = []
+      replayMask(dims)
+    }
+    if (mosaicCount !== mosaicAtOpen.current) {
+      track('mosaic', { strokes: mosaicCount - mosaicAtOpen.current, level: mosaicLevel })
+    }
     setTool('erase')
   }
 
@@ -1293,7 +1383,7 @@ export default function Editor({
         }
         return
       }
-      if (tool !== 'erase') return
+      if (tool !== 'erase' && tool !== 'mosaic') return
       if (e.key === '[') setBrush((b) => Math.max(8, b - 4))
       if (e.key === ']') setBrush((b) => Math.min(96, b + 4))
       const mod = e.metaKey || e.ctrlKey
@@ -1324,6 +1414,7 @@ export default function Editor({
 
   const hasEdit =
     eraseCount > 0 ||
+    mosaicCount > 0 ||
     textTool.items.length > 0 ||
     glitterTool.items.length > 0 ||
     !isIdentityOrientation(orientation) ||
@@ -1355,6 +1446,8 @@ export default function Editor({
     ? 'drag to select the area to keep'
     : tool === 'export'
     ? 'choose a format — then download, copy or share'
+    : tool === 'mosaic'
+    ? 'brush over faces or text to pixelate them'
     : tool === 'adjust'
     ? adjustGL === 'ready'
       ? 'rotate, flip, or slide to adjust'
@@ -1497,7 +1590,7 @@ export default function Editor({
           })()}
           {/* brush cursor — sized in the container's local space so it stays a
               constant on-screen size after the transform scales it. */}
-          {cursor && !busy && !cropping && tool === 'erase' && (
+          {cursor && !busy && !cropping && (tool === 'erase' || tool === 'mosaic') && (
             <div
               aria-hidden
               className="absolute pointer-events-none rounded-full border"
@@ -1629,6 +1722,18 @@ export default function Editor({
           onShare={share}
           onDone={() => setTool('erase')}
         />
+      ) : tool === 'mosaic' ? (
+        <MosaicControls
+          brush={brush}
+          level={mosaicLevel}
+          canUndo={historyLen > 0 || cropUndoAvailable}
+          canRedo={redoLen > 0}
+          onBrush={setBrush}
+          onLevel={setMosaicLevel}
+          onUndo={undo}
+          onRedo={redo}
+          onDone={exitMosaic}
+        />
       ) : tool === 'glitter' ? (
         <GlitterControls
           draft={glitterTool.draft}
@@ -1680,6 +1785,14 @@ export default function Editor({
             disabled={busy}
           >
             glitter
+          </button>
+          <button
+            type="button"
+            className="ctrl label px-3 sm:px-4 h-9 sm:h-10 cursor-pointer"
+            onClick={enterMosaic}
+            disabled={busy}
+          >
+            mosaic
           </button>
           <button
             type="button"
