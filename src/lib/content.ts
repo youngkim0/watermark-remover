@@ -4,6 +4,9 @@ export const SITE_NAME = 'Unmark'
 // Displayed in the footer. Bump together with package.json's "version".
 export const VERSION = 'v1.1.2'
 
+// Buy Me a Coffee page linked from the footer; the button is hidden while null.
+export const DONATE_URL: string | null = null
+
 export const TAGLINE = 'Free AI watermark remover & magic eraser — in your browser'
 
 // What the inpainting brush can remove. Watermarks lead; the rest shows breadth.
