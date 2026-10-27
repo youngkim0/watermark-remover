@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import Dropzone from '@/components/Dropzone'
 import Editor from '@/components/Editor'
-import { USE_CASES, STEPS, REASONS, FAQ, VERSION } from '@/lib/content'
+import { USE_CASES, STEPS, REASONS, FAQ, VERSION, DONATE_URL } from '@/lib/content'
+import { track } from '@/lib/analytics'
 
 function Header({ onHome }: { onHome: () => void }) {
   return (
@@ -19,7 +20,20 @@ function Header({ onHome }: { onHome: () => void }) {
       >
         Unmark<span className="text-amber not-italic">.</span>
       </button>
-      <span className="label text-ink-faint hidden sm:block">watermark remover · magic eraser</span>
+      <div className="flex items-center gap-4">
+        <span className="label text-ink-faint hidden sm:block">watermark remover · magic eraser</span>
+        {DONATE_URL && (
+          <a
+            href={DONATE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => track('donate-click')}
+            className="label ctrl px-2.5 py-1 whitespace-nowrap hover:!text-amber hover:!border-amber"
+          >
+            ☕ Buy me a coffee
+          </a>
+        )}
+      </div>
     </header>
   )
 }
@@ -33,9 +47,9 @@ function Footer({ className = '' }: { className?: string }) {
       <span className="label text-ink-faint hidden sm:block">
         mi-gan · is-net · onnx runtime · webgpu/wasm
       </span>
-      <span className="label text-ink-faint flex items-center gap-3">
-        <a href="mailto:ezpzco58@google.com" className="hover:text-ink-base">
-          ezpzco58@google.com
+      <span className="label text-ink-faint flex flex-wrap items-center justify-end gap-x-3 gap-y-1 whitespace-nowrap">
+        <a href="mailto:ezpzco58@gmail.com" className="hover:text-ink-base">
+          ezpzco58@gmail.com
         </a>
         <span>© 2026 ezpz co.</span>
         <span className="tabular-nums">{VERSION}</span>
