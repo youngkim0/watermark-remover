@@ -5,7 +5,7 @@ export const SITE_NAME = 'Unmark'
 export const VERSION = 'v1.1.2'
 
 // Buy Me a Coffee page linked from the footer; the button is hidden while null.
-export const DONATE_URL: string | null = null
+export const DONATE_URL: string | null = 'https://buymeacoffee.com/ezpzco'
 
 export const TAGLINE = 'Free AI watermark remover & magic eraser — in your browser'
 
