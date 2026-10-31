@@ -1,12 +1,25 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import Dropzone from '@/components/Dropzone'
 import Editor from '@/components/Editor'
-import { USE_CASES, STEPS, REASONS, FAQ, VERSION, DONATE_URL } from '@/lib/content'
+import { USE_CASES, STEPS, REASONS, FAQ, VERSION, DONATE_URL, SUPPORT_URL } from '@/lib/content'
 import { track } from '@/lib/analytics'
 
+// Chinese-language browsers get a label that says Alipay/WeChat Pay work.
+// It's false on the server and during hydration, then reads navigator.
+const noSubscribe = () => () => {}
+function useChineseBrowser() {
+  return useSyncExternalStore(
+    noSubscribe,
+    () => navigator.language.toLowerCase().startsWith('zh'),
+    () => false,
+  )
+}
+
 function Header({ onHome }: { onHome: () => void }) {
+  const zh = useChineseBrowser()
+  const supportHref = SUPPORT_URL ?? DONATE_URL
   return (
     <header
       className="flex items-center justify-between px-6 py-3 sm:py-4 border-b shrink-0"
@@ -22,15 +35,17 @@ function Header({ onHome }: { onHome: () => void }) {
       </button>
       <div className="flex items-center gap-4">
         <span className="label text-ink-faint hidden sm:block">watermark remover · magic eraser</span>
-        {DONATE_URL && (
+        {supportHref && (
           <a
-            href={DONATE_URL}
+            href={supportHref}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={() => track('donate-click')}
+            onClick={() =>
+              track('donate-click', { to: SUPPORT_URL ? 'lemonsqueezy' : 'bmc', zh, from: 'header' })
+            }
             className="label ctrl px-2.5 py-1 whitespace-nowrap hover:!text-amber hover:!border-amber"
           >
-            ☕ Buy me a coffee
+            {SUPPORT_URL && zh ? '☕ 支持 · 支付宝 / 微信' : '☕ Buy me a coffee'}
           </a>
         )}
       </div>
@@ -51,6 +66,17 @@ function Footer({ className = '' }: { className?: string }) {
         <a href="mailto:ezpzco58@gmail.com" className="hover:text-ink-base">
           ezpzco58@gmail.com
         </a>
+        {SUPPORT_URL && DONATE_URL && (
+          <a
+            href={DONATE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => track('donate-click', { to: 'bmc', from: 'footer' })}
+            className="hover:text-ink-base"
+          >
+            buymeacoffee
+          </a>
+        )}
         <span>© 2026 ezpz co.</span>
         <span className="tabular-nums">{VERSION}</span>
       </span>
