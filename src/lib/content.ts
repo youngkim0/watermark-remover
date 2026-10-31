@@ -4,8 +4,16 @@ export const SITE_NAME = 'Unmark'
 // Displayed in the footer. Bump together with package.json's "version".
 export const VERSION = 'v1.1.2'
 
-// Buy Me a Coffee page linked from the footer; the button is hidden while null.
+// Buy Me a Coffee page. It's the header button while SUPPORT_URL is null and
+// moves to the footer once SUPPORT_URL is set; hidden entirely while null.
 export const DONATE_URL: string | null = 'https://buymeacoffee.com/ezpzco'
+
+// Lemon Squeezy checkout for the pay-what-you-want "Unmark Supporter" product.
+// It takes cards, PayPal, Alipay and WeChat Pay, so it becomes the header
+// button when set. Buy Me a Coffee has no Alipay/WeChat, and most clicks come
+// from mainland China.
+export const SUPPORT_URL: string | null =
+  'https://ezpzkr.lemonsqueezy.com/checkout/buy/031b0d66-cd67-4ff8-89b2-ac20daa6149b'
 
 export const TAGLINE = 'Free AI watermark remover & magic eraser — in your browser'
 
