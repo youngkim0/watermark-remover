@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Self-hosted on Hermes as a Node container (see deploy/).
+  output: "standalone",
   async headers() {
     return [
       {
